@@ -9,8 +9,6 @@
 /* Begin PBXBuildFile section */
 		9B4B6D7730284A01008101B9 /* SnapCore in Frameworks */ = {isa = PBXBuildFile; productRef = 9B4B6D7630284A01008101B9 /* SnapCore */; };
 		9B4B6D7930284A01008101B9 /* SnapCoreEngine in Frameworks */ = {isa = PBXBuildFile; productRef = 9B4B6D7830284A01008101B9 /* SnapCoreEngine */; };
-		9BE567293021805900D33AE6 /* SnapCore in Frameworks */ = {isa = PBXBuildFile; productRef = 9BE567283021805900D33AE6 /* SnapCore */; };
-		9BE5672B3021805900D33AE6 /* SnapCoreEngine in Frameworks */ = {isa = PBXBuildFile; productRef = 9BE5672A3021805900D33AE6 /* SnapCoreEngine */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -42,9 +40,7 @@
 		9BE567023021803000D33AE6 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			files = (
-				9BE567293021805900D33AE6 /* SnapCore in Frameworks */,
 				9B4B6D7730284A01008101B9 /* SnapCore in Frameworks */,
-				9BE5672B3021805900D33AE6 /* SnapCoreEngine in Frameworks */,
 				9B4B6D7930284A01008101B9 /* SnapCoreEngine in Frameworks */,
 			);
 		};
@@ -85,8 +81,6 @@
 			);
 			name = macOSFramesToFireTV;
 			packageProductDependencies = (
-				9BE567283021805900D33AE6 /* SnapCore */,
-				9BE5672A3021805900D33AE6 /* SnapCoreEngine */,
 				9B4B6D7630284A01008101B9 /* SnapCore */,
 				9B4B6D7830284A01008101B9 /* SnapCoreEngine */,
 			);
@@ -383,14 +377,6 @@
 		9B4B6D7830284A01008101B9 /* SnapCoreEngine */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = 9B4B6D7530284A01008101B9 /* XCRemoteSwiftPackageReference "SnapCore" */;
-			productName = SnapCoreEngine;
-		};
-		9BE567283021805900D33AE6 /* SnapCore */ = {
-			isa = XCSwiftPackageProductDependency;
-			productName = SnapCore;
-		};
-		9BE5672A3021805900D33AE6 /* SnapCoreEngine */ = {
-			isa = XCSwiftPackageProductDependency;
 			productName = SnapCoreEngine;
 		};
 /* End XCSwiftPackageProductDependency section */

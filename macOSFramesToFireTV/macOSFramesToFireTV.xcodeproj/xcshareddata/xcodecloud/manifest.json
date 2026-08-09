@@ -1,0 +1,9 @@
+{
+  "id" : "800f25a3-64d5-468d-b362-70b9781e17ea",
+  "targets" : [
+    {
+      "id" : "eae8c5bc-9426-4c43-a775-7fef99cc8245",
+      "name" : "macOSFramesToFireTV"
+    }
+  ]
+}

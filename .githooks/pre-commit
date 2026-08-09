@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+
+project_file="macOSFramesToFireTV/macOSFramesToFireTV.xcodeproj/project.pbxproj"
+
+# Only touch the index when the project file is already part of this commit.
+if git diff --cached --quiet -- "$project_file"; then
+    exit 0
+fi
+
+temp_file="$(mktemp "${TMPDIR:-/tmp}/macos-frames-pbxproj.XXXXXX")"
+trap 'rm -f "$temp_file"' EXIT HUP INT TERM
+
+git show ":$project_file" > "$temp_file"
+perl -0pi -e 's/\bobjectVersion = 110;/objectVersion = 77;/' "$temp_file"
+
+if ! grep -q '^[[:space:]]*objectVersion = 77;' "$temp_file"; then
+    echo "error: could not normalize macOS Xcode project format to 77" >&2
+    exit 1
+fi
+
+mode="$(git ls-files -s -- "$project_file" | awk 'NR == 1 { print $1 }')"
+blob="$(git hash-object -w -- "$temp_file")"
+git update-index --add --cacheinfo "$mode" "$blob" "$project_file"
+
+# Keep the working copy aligned without staging unrelated project-file edits.
+if [ -f "$project_file" ]; then
+    perl -0pi -e 's/\bobjectVersion = 110;/objectVersion = 77;/' "$project_file"
+fi
+
+echo "Normalized macOS Xcode project format to objectVersion 77."

@@ -1,0 +1,8 @@
+.DS_Store
+DerivedData/
+**/xcuserdata/
+*.xcuserstate
+fire-tv/.gradle/
+fire-tv/build/
+fire-tv/app/build/
+fire-tv/local.properties

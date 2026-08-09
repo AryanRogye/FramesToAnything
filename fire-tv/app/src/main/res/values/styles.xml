@@ -1,0 +1,10 @@
+<resources>
+    <style name="Theme.IOSFireTV" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:colorAccent">#6EA8FE</item>
+        <item name="android:navigationBarColor">#080B10</item>
+        <item name="android:windowLightNavigationBar">false</item>
+    </style>
+</resources>

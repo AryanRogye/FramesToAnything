@@ -1,6 +1,15 @@
 {
-  "originHash" : "9b731164af4f11db268041dbae2dd06ddb9ced6664d71c1ca65ba6239a09965c",
+  "originHash" : "2187611c03d6a98cd5645a4f1716c8a9a51beac07140d75d885aff0038090acd",
   "pins" : [
+    {
+      "identity" : "snapcore",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/AryanRogye/SnapCore",
+      "state" : {
+        "branch" : "main",
+        "revision" : "97f51f3e5a865ddd5fe7bbfc68da61b20786a680"
+      }
+    },
     {
       "identity" : "swift-collections",
       "kind" : "remoteSourceControl",

@@ -9,7 +9,7 @@ Supported paths:
 | --- | --- | --- |
 | iPhone or iPad | Fire TV / Android TV | `iOSFramesToFireTV.xcodeproj` + `fire-tv/` |
 | Mac | Fire TV / Android TV | `macOSFramesToFireTV/macOSFramesToFireTV.xcodeproj` + `fire-tv/` |
-| Mac | iPhone or iPad | `macOSFramesToFireTV/macOSFramesToFireTV.xcodeproj` on both devices |
+| Mac | iPhone or iPad | `macOSFramesToFireTV/macOSFramesToFireTV.xcodeproj` + `iOSFramesReceiver/iOSFramesReceiver.xcodeproj` |
 
 All pairing and media traffic stays on the LAN. A six-digit code authenticates each session, PBKDF2-HMAC-SHA256 derives the session key, and AES-256-GCM protects every media packet.
 
@@ -23,10 +23,10 @@ All pairing and media traffic stays on the LAN. A six-digit code authenticates e
 ├── FireTVBroadcastSetupUI/            ReplayKit setup UI extension
 ├── Configuration/                     Shared iOS sender configuration
 ├── macOSFramesToFireTV/
-│   ├── macOSFramesToFireTV.xcodeproj/ Shared macOS/iOS project
+│   ├── macOSFramesToFireTV.xcodeproj/ Mac sender project
 │   └── macOSFramesToFireTV/
-│       ├── macOS/                     Mac capture, encoding, and transport
-│       └── iOS/                       iPhone/iPad receiver and media player
+│       └── macOS/                     Mac capture, encoding, and transport
+├── iOSFramesReceiver/                 Standalone iPhone/iPad receiver project
 └── fire-tv/                           Kotlin Android TV / Fire TV receiver
 ```
 
@@ -64,7 +64,7 @@ The small ReplayKit setup extension used by the system broadcast flow.
 
 ### `macOSFramesToFireTV/macOSFramesToFireTV.xcodeproj`
 
-This is one multiplatform SwiftUI target with different implementations selected at compile time.
+This is the macOS-only SwiftUI sender target.
 
 #### macOS build — Mac sender
 
@@ -79,7 +79,11 @@ The Mac version:
 
 Screen Recording permission is required on first launch.
 
-#### iOS/iPadOS build — Mac receiver
+### `iOSFramesReceiver/iOSFramesReceiver.xcodeproj`
+
+This standalone iOS/iPadOS app uses bundle ID `com.aryanrogye.iOSFramesReceiver` so it can have its own App Store Connect and TestFlight record.
+
+#### iOS/iPadOS Mac receiver
 
 The iPhone/iPad version:
 
@@ -152,8 +156,8 @@ ReplayKit may intentionally produce black video for DRM-protected content. Some 
 
 ### Mac → iPhone/iPad
 
-1. Open `macOSFramesToFireTV/macOSFramesToFireTV.xcodeproj` in Xcode.
-2. Run the `macOSFramesToFireTV` scheme on the physical iPhone or iPad.
+1. Open `iOSFramesReceiver/iOSFramesReceiver.xcodeproj` in Xcode.
+2. Run the `iOSFramesReceiver` scheme on the physical iPhone or iPad.
 3. Leave the iOS receiver open and note its six-digit code.
 4. Run the same scheme on the Mac.
 5. Enter the iOS receiver's code in the Mac app and start pairing.

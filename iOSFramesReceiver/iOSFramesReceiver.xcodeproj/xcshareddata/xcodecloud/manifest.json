@@ -1,0 +1,9 @@
+{
+  "id" : "76069aec-df07-41ea-a6ec-42be93eba0cc",
+  "targets" : [
+    {
+      "id" : "7376bf53-4884-4ef2-baf7-909326b699c5",
+      "name" : "iOSFramesReceiver"
+    }
+  ]
+}

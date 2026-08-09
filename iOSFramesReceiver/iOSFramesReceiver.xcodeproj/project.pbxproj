@@ -6,57 +6,52 @@
 	objectVersion = 77;
 	objects = {
 
-/* Begin PBXBuildFile section */
-		9B4B6D7730284A01008101B9 /* SnapCore in Frameworks */ = {isa = PBXBuildFile; productRef = 9B4B6D7630284A01008101B9 /* SnapCore */; };
-/* End PBXBuildFile section */
-
 /* Begin PBXFileReference section */
-		9BE567053021803000D33AE6 /* macOSFramesToFireTV.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = macOSFramesToFireTV.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		9B4B6E9B30285CE2008101B9 /* iOSFramesReceiver.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = iOSFramesReceiver.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
-		A20000013021A00100000001 /* Exceptions for "macOSFramesToFireTV" folder in "macOSFramesToFireTV" target */ = {
+		A200001030285CE200000001 /* Exceptions for "iOSFramesReceiver" folder in "iOSFramesReceiver" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				Info.plist,
 			);
-			target = 9BE567043021803000D33AE6 /* macOSFramesToFireTV */;
+			target = 9B4B6E9A30285CE2008101B9 /* iOSFramesReceiver */;
 		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
-		9BE567073021803000D33AE6 /* macOSFramesToFireTV */ = {
+		9B4B6E9D30285CE2008101B9 /* iOSFramesReceiver */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
-				A20000013021A00100000001 /* Exceptions for "macOSFramesToFireTV" folder in "macOSFramesToFireTV" target */,
+				A200001030285CE200000001 /* Exceptions for "iOSFramesReceiver" folder in "iOSFramesReceiver" target */,
 			);
-			path = macOSFramesToFireTV;
+			path = iOSFramesReceiver;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
-		9BE567023021803000D33AE6 /* Frameworks */ = {
+		9B4B6E9830285CE2008101B9 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			files = (
-				9B4B6D7730284A01008101B9 /* SnapCore in Frameworks */,
 			);
 		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
-		9BE566FC3021803000D33AE6 = {
+		9B4B6E9230285CE1008101B9 = {
 			isa = PBXGroup;
 			children = (
-				9BE567073021803000D33AE6 /* macOSFramesToFireTV */,
-				9BE567063021803000D33AE6 /* Products */,
+				9B4B6E9D30285CE2008101B9 /* iOSFramesReceiver */,
+				9B4B6E9C30285CE2008101B9 /* Products */,
 			);
 			sourceTree = "<group>";
 		};
-		9BE567063021803000D33AE6 /* Products */ = {
+		9B4B6E9C30285CE2008101B9 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				9BE567053021803000D33AE6 /* macOSFramesToFireTV.app */,
+				9B4B6E9B30285CE2008101B9 /* iOSFramesReceiver.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -64,66 +59,60 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		9BE567043021803000D33AE6 /* macOSFramesToFireTV */ = {
+		9B4B6E9A30285CE2008101B9 /* iOSFramesReceiver */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 9BE567103021803100D33AE6 /* Build configuration list for PBXNativeTarget "macOSFramesToFireTV" */;
+			buildConfigurationList = 9B4B6EA630285CE2008101B9 /* Build configuration list for PBXNativeTarget "iOSFramesReceiver" */;
 			buildPhases = (
-				9BE567013021803000D33AE6 /* Sources */,
-				9BE567023021803000D33AE6 /* Frameworks */,
-				9BE567033021803000D33AE6 /* Resources */,
+				9B4B6E9730285CE2008101B9 /* Sources */,
+				9B4B6E9830285CE2008101B9 /* Frameworks */,
+				9B4B6E9930285CE2008101B9 /* Resources */,
 			);
 			buildRules = (
 			);
 			fileSystemSynchronizedGroups = (
-				9BE567073021803000D33AE6 /* macOSFramesToFireTV */,
+				9B4B6E9D30285CE2008101B9 /* iOSFramesReceiver */,
 			);
-			name = macOSFramesToFireTV;
-			packageProductDependencies = (
-				9B4B6D7630284A01008101B9 /* SnapCore */,
-			);
-			productName = macOSFramesToFireTV;
-			productReference = 9BE567053021803000D33AE6 /* macOSFramesToFireTV.app */;
+			name = iOSFramesReceiver;
+			productName = iOSFramesReceiver;
+			productReference = 9B4B6E9B30285CE2008101B9 /* iOSFramesReceiver.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
-		9BE566FD3021803000D33AE6 /* Project object */ = {
+		9B4B6E9330285CE1008101B9 /* Project object */ = {
 			isa = PBXProject;
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
 				LastSwiftUpdateCheck = 2700;
 				LastUpgradeCheck = 2700;
 				TargetAttributes = {
-					9BE567043021803000D33AE6 = {
+					9B4B6E9A30285CE2008101B9 = {
 						CreatedOnToolsVersion = 27.0;
 					};
 				};
 			};
-			buildConfigurationList = 9BE567003021803000D33AE6 /* Build configuration list for PBXProject "macOSFramesToFireTV" */;
+			buildConfigurationList = 9B4B6E9630285CE1008101B9 /* Build configuration list for PBXProject "iOSFramesReceiver" */;
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
 			knownRegions = (
 				en,
 				Base,
 			);
-			mainGroup = 9BE566FC3021803000D33AE6;
+			mainGroup = 9B4B6E9230285CE1008101B9;
 			minimizedProjectReferenceProxies = 1;
-			packageReferences = (
-				9B4B6D7530284A01008101B9 /* XCRemoteSwiftPackageReference "SnapCore" */,
-			);
 			preferredProjectObjectVersion = 77;
-			productRefGroup = 9BE567063021803000D33AE6 /* Products */;
+			productRefGroup = 9B4B6E9C30285CE2008101B9 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				9BE567043021803000D33AE6 /* macOSFramesToFireTV */,
+				9B4B6E9A30285CE2008101B9 /* iOSFramesReceiver */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
-		9BE567033021803000D33AE6 /* Resources */ = {
+		9B4B6E9930285CE2008101B9 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			files = (
 			);
@@ -131,7 +120,7 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
-		9BE567013021803000D33AE6 /* Sources */ = {
+		9B4B6E9730285CE2008101B9 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			files = (
 			);
@@ -139,7 +128,7 @@
 /* End PBXSourcesBuildPhase section */
 
 /* Begin XCBuildConfiguration section */
-		9BE5670E3021803100D33AE6 /* Debug configuration for PBXProject "macOSFramesToFireTV" */ = {
+		9B4B6EA430285CE2008101B9 /* Debug configuration for PBXProject "iOSFramesReceiver" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
@@ -192,18 +181,18 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
-				MACOSX_DEPLOYMENT_TARGET = 27.0;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
-				SDKROOT = macosx;
+				SDKROOT = iphoneos;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 			};
 			name = Debug;
 		};
-		9BE5670F3021803100D33AE6 /* Release configuration for PBXProject "macOSFramesToFireTV" */ = {
+		9B4B6EA530285CE2008101B9 /* Release configuration for PBXProject "iOSFramesReceiver" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
@@ -250,129 +239,95 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
-				MACOSX_DEPLOYMENT_TARGET = 27.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
-				SDKROOT = macosx;
+				SDKROOT = iphoneos;
 				SWIFT_COMPILATION_MODE = wholemodule;
+				VALIDATE_PRODUCT = YES;
 			};
 			name = Release;
 		};
-		9BE567113021803100D33AE6 /* Debug configuration for PBXNativeTarget "macOSFramesToFireTV" */ = {
+		9B4B6EA730285CE2008101B9 /* Debug configuration for PBXNativeTarget "iOSFramesReceiver" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
-				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = macOSFramesToFireTV/macOSFramesToFireTV.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = B9P888266K;
-				ENABLE_APP_SANDBOX = YES;
-				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
-				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = macOSFramesToFireTV/Info.plist;
-				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_FILE = iOSFramesReceiver/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
-					"@executable_path/../Frameworks",
+					"@executable_path/Frameworks",
 				);
-				MACOSX_DEPLOYMENT_TARGET = 15.6;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.aryanrogye.macOSFramesToFireTV;
+				PRODUCT_BUNDLE_IDENTIFIER = com.aryanrogye.iOSFramesReceiver;
 				PRODUCT_NAME = "$(TARGET_NAME)";
-				REGISTER_APP_GROUPS = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
-				SUPPORTED_PLATFORMS = macosx;
-				SUPPORTS_MACCATALYST = NO;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
 			};
 			name = Debug;
 		};
-		9BE567123021803100D33AE6 /* Release configuration for PBXNativeTarget "macOSFramesToFireTV" */ = {
+		9B4B6EA830285CE2008101B9 /* Release configuration for PBXNativeTarget "iOSFramesReceiver" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
-				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = macOSFramesToFireTV/macOSFramesToFireTV.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = B9P888266K;
-				ENABLE_APP_SANDBOX = YES;
-				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
-				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = macOSFramesToFireTV/Info.plist;
-				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_FILE = iOSFramesReceiver/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
-					"@executable_path/../Frameworks",
+					"@executable_path/Frameworks",
 				);
-				MACOSX_DEPLOYMENT_TARGET = 15.6;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.aryanrogye.macOSFramesToFireTV;
+				PRODUCT_BUNDLE_IDENTIFIER = com.aryanrogye.iOSFramesReceiver;
 				PRODUCT_NAME = "$(TARGET_NAME)";
-				REGISTER_APP_GROUPS = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
-				SUPPORTED_PLATFORMS = macosx;
-				SUPPORTS_MACCATALYST = NO;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
 			};
 			name = Release;
 		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		9BE567003021803000D33AE6 /* Build configuration list for PBXProject "macOSFramesToFireTV" */ = {
+		9B4B6E9630285CE1008101B9 /* Build configuration list for PBXProject "iOSFramesReceiver" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				9BE5670E3021803100D33AE6 /* Debug configuration for PBXProject "macOSFramesToFireTV" */,
-				9BE5670F3021803100D33AE6 /* Release configuration for PBXProject "macOSFramesToFireTV" */,
+				9B4B6EA430285CE2008101B9 /* Debug configuration for PBXProject "iOSFramesReceiver" */,
+				9B4B6EA530285CE2008101B9 /* Release configuration for PBXProject "iOSFramesReceiver" */,
 			);
 			defaultConfigurationName = Release;
 		};
-		9BE567103021803100D33AE6 /* Build configuration list for PBXNativeTarget "macOSFramesToFireTV" */ = {
+		9B4B6EA630285CE2008101B9 /* Build configuration list for PBXNativeTarget "iOSFramesReceiver" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				9BE567113021803100D33AE6 /* Debug configuration for PBXNativeTarget "macOSFramesToFireTV" */,
-				9BE567123021803100D33AE6 /* Release configuration for PBXNativeTarget "macOSFramesToFireTV" */,
+				9B4B6EA730285CE2008101B9 /* Debug configuration for PBXNativeTarget "iOSFramesReceiver" */,
+				9B4B6EA830285CE2008101B9 /* Release configuration for PBXNativeTarget "iOSFramesReceiver" */,
 			);
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
-
-/* Begin XCRemoteSwiftPackageReference section */
-		9B4B6D7530284A01008101B9 /* XCRemoteSwiftPackageReference "SnapCore" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/AryanRogye/SnapCore";
-			requirement = {
-				branch = "frames-to-anything";
-				kind = branch;
-			};
-		};
-/* End XCRemoteSwiftPackageReference section */
-
-/* Begin XCSwiftPackageProductDependency section */
-		9B4B6D7630284A01008101B9 /* SnapCore */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = 9B4B6D7530284A01008101B9 /* XCRemoteSwiftPackageReference "SnapCore" */;
-			productName = SnapCore;
-		};
-/* End XCSwiftPackageProductDependency section */
 	};
-	rootObject = 9BE566FD3021803000D33AE6 /* Project object */;
+	rootObject = 9B4B6E9330285CE1008101B9 /* Project object */;
 	validationLevel = 1;
 }

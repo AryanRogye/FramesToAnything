@@ -45,8 +45,12 @@ class MainActivity : Activity(), PairingServer.Listener {
         server = PairingServer(applicationContext, this)
         configureRemoteMediaSession()
         mediaPlayer = FireTVMediaPlayer(
-            onReport = server::sendReceiverReport,
-            onKeyFrameNeeded = server::requestKeyFrame,
+            // Resolve the current server when each callback fires. The receiver
+            // can replace its PairingServer from the in-app restart control.
+            onReport = { report -> server.sendReceiverReport(report) },
+            onKeyFrameNeeded = { reason, timestamp ->
+                server.requestKeyFrame(reason, timestamp)
+            },
         )
         surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) {

@@ -10,44 +10,56 @@ import android.util.Log
 import android.view.Surface
 import java.nio.ByteBuffer
 import java.util.concurrent.LinkedBlockingDeque
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
-/** Hardware video decode and bounded, low-latency PCM playback for live mirroring. */
-class FireTVMediaPlayer {
+/** Low-latency hardware playback with a bounded audio-clocked jitter buffer. */
+class FireTVMediaPlayer(
+    private val onReport: (CinemaPlaybackReport) -> Unit = {},
+    private val onKeyFrameNeeded: (String, Long) -> Unit = { _, _ -> },
+) {
+    private val running = AtomicBoolean(true)
+    private val decoderLock = Any()
+    private val audioLock = Any()
+    private val clock = CinemaClock()
+    private val videoQueue = LinkedBlockingDeque<VideoFrame>(MAX_VIDEO_FRAMES)
+    private val audioQueue = LinkedBlockingDeque<AudioPacket>(MAX_AUDIO_PACKETS)
+
     private var surface: Surface? = null
     private var decoder: MediaCodec? = null
+    private var audioDecoder: MediaCodec? = null
     private var audioTrack: AudioTrack? = null
     private var videoConfiguration: VideoConfiguration? = null
+    private var audioSampleRate = 0
+    private var audioChannels = 0
+    @Volatile private var audioEncoding = 0
+    private var waitingForKeyFrame = true
+    private var audioFramesWritten = 0L
+    private var firstAudioTimestampMilliseconds: Long? = null
+    private var underruns = 0L
+    private var recoveries = 0L
+    @Volatile private var lastPresentedTimestampMilliseconds = 0L
+    @Volatile private var lastReceivedVideoTimestampMilliseconds = 0L
+    @Volatile private var firstPlayableVideoTimestampMilliseconds = 0L
+
     private val outputInfo = MediaCodec.BufferInfo()
-    private var queuedVideoFrames = 0L
-    private var renderedVideoFrames = 0L
-    private val audioQueue = LinkedBlockingDeque<ByteArray>(MAX_QUEUED_AUDIO_CHUNKS)
-    private val audioWriterRunning = AtomicBoolean(true)
-    private val audioWriter = thread(
-        start = true,
-        isDaemon = true,
-        name = "fire-tv-audio-writer",
-    ) {
-        while (audioWriterRunning.get()) {
+
+    private val videoWorker = thread(start = true, isDaemon = true, name = "fire-tv-video-decoder") {
+        videoLoop()
+    }
+    private val audioWorker = thread(start = true, isDaemon = true, name = "fire-tv-audio-writer") {
+        audioLoop()
+    }
+    private val reportWorker = thread(start = true, isDaemon = true, name = "fire-tv-cinema-reports") {
+        while (running.get()) {
             try {
-                val pcm = audioQueue.takeFirst()
-                val track = synchronized(this) { audioTrack } ?: continue
-                var offset = 0
-                while (offset < pcm.size && audioWriterRunning.get()) {
-                    val written = track.write(
-                        pcm,
-                        offset,
-                        pcm.size - offset,
-                        AudioTrack.WRITE_BLOCKING,
-                    )
-                    if (written <= 0) break
-                    offset += written
+                Thread.sleep(REPORT_INTERVAL_MILLISECONDS)
+                if (clock.isStarted() && lastReceivedVideoTimestampMilliseconds > 0) {
+                    onReport(currentReport())
                 }
             } catch (_: InterruptedException) {
-                // Release wakes the writer so its thread can exit.
-            } catch (error: IllegalStateException) {
-                Log.w(TAG, "audio track changed while writing", error)
+                break
             }
         }
     }
@@ -60,94 +72,72 @@ class FireTVMediaPlayer {
         sps: ByteArray,
         pps: ByteArray,
     ) {
-        val configuration = VideoConfiguration(
-            width = width,
-            height = height,
-            rotationDegrees = rotationDegrees,
-            sps = sps.copyOf(),
-            pps = pps.copyOf(),
+        videoConfiguration = VideoConfiguration(
+            width,
+            height,
+            rotationDegrees,
+            sps.copyOf(),
+            pps.copyOf(),
         )
-        videoConfiguration = configuration
-        startVideoDecoder(configuration)
+        videoQueue.clear()
+        waitingForKeyFrame = true
+        startVideoDecoder()
     }
 
-    /** Rebinds decoding whenever Android recreates the TextureView surface. */
+    /** SurfaceView surfaces support timestamped presentation at VSYNC. */
     @Synchronized
     fun setSurface(newSurface: Surface?) {
-        releaseVideo()
-        surface?.release()
+        synchronized(decoderLock) { releaseVideoLocked() }
         surface = newSurface
-        videoConfiguration?.let(::startVideoDecoder)
+        waitingForKeyFrame = true
+        videoConfiguration?.let { startVideoDecoder() }
+        if (newSurface != null) requestKeyFrame("surface_changed")
     }
 
-    private fun startVideoDecoder(configuration: VideoConfiguration) {
-        releaseVideo()
-        val targetSurface = surface
-        if (targetSurface == null || !targetSurface.isValid) {
-            Log.i(TAG, "Video configuration retained until the display surface is ready")
-            return
-        }
-        val (width, height, rotationDegrees, sps, pps) = configuration
-        Log.i(TAG, "configureVideo ${width}x$height rotation=$rotationDegrees surfaceValid=${targetSurface.isValid}")
-        val codec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
-            setByteBuffer("csd-0", ByteBuffer.wrap(START_CODE + sps))
-            setByteBuffer("csd-1", ByteBuffer.wrap(START_CODE + pps))
-            setInteger(MediaFormat.KEY_ROTATION, rotationDegrees)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
-            }
-            setInteger(MediaFormat.KEY_PRIORITY, 0)
-        }
-        codec.configure(format, targetSurface, null, 0)
-        codec.start()
-        decoder = codec
-        queuedVideoFrames = 0
-        renderedVideoFrames = 0
-    }
-
-    @Synchronized
     fun queueVideo(data: ByteArray, timestampMilliseconds: Long, keyFrame: Boolean) {
-        val codec = decoder ?: return
-        drainVideo(codec)
+        if (!running.get()) return
+        lastReceivedVideoTimestampMilliseconds = timestampMilliseconds
+        synchronized(this) {
+            if (waitingForKeyFrame && !keyFrame) return
+            if (keyFrame) waitingForKeyFrame = false
+        }
 
-        val inputIndex = codec.dequeueInputBuffer(0)
-        if (inputIndex < 0) {
-            if (queuedVideoFrames % 120L == 0L) Log.w(TAG, "decoder input busy after $queuedVideoFrames frames")
-            return // Freshness is more important than retaining an old frame.
+        val frame = VideoFrame(data, timestampMilliseconds, keyFrame)
+        if (!clock.isStarted() && keyFrame) {
+            // Until audio is ready, retain only the newest complete GOP. Video
+            // can arrive seconds before the first audio packet after capture
+            // startup; decoding that old prefix makes the stream feel delayed.
+            videoQueue.clear()
+            firstPlayableVideoTimestampMilliseconds = timestampMilliseconds
+        } else if (firstPlayableVideoTimestampMilliseconds == 0L) {
+            firstPlayableVideoTimestampMilliseconds = timestampMilliseconds
         }
-        val input = codec.getInputBuffer(inputIndex) ?: return
-        input.clear()
-        if (data.size > input.remaining()) return
-        input.put(data)
-        codec.queueInputBuffer(
-            inputIndex,
-            0,
-            data.size,
-            timestampMilliseconds * 1_000,
-            if (keyFrame) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0,
-        )
-        queuedVideoFrames += 1
-        if (queuedVideoFrames == 1L || queuedVideoFrames % 120L == 0L) {
-            Log.d(TAG, "queued video=$queuedVideoFrames rendered=$renderedVideoFrames bytes=${data.size} key=$keyFrame")
+        if (!videoQueue.offerLast(frame)) {
+            enterRecovery("video_queue_overflow")
+            if (keyFrame) {
+                synchronized(this) { waitingForKeyFrame = false }
+                videoQueue.offerLast(frame)
+            }
         }
-        drainVideo(codec)
     }
 
     @Synchronized
-    fun configureAudio(sampleRate: Int, channels: Int) {
+    fun configureAudio(sampleRate: Int, channels: Int, encoding: Int, codecConfig: ByteArray) {
+        val requiresPlaybackRecovery = clock.isStarted()
         releaseAudio()
         audioQueue.clear()
-        val channelMask = if (channels == 1) {
+        clock.reset()
+        if (encoding != AUDIO_PCM_16 && encoding != AUDIO_AAC_LC) {
+            Log.w(TAG, "Unsupported audio encoding $encoding (${codecConfig.size} config bytes)")
+            return
+        }
+        audioSampleRate = sampleRate
+        audioChannels = channels.coerceIn(1, 2)
+        val channelMask = if (audioChannels == 1) {
             AudioFormat.CHANNEL_OUT_MONO
         } else {
             AudioFormat.CHANNEL_OUT_STEREO
         }
-        val minimum = AudioTrack.getMinBufferSize(
-            sampleRate,
-            channelMask,
-            AudioFormat.ENCODING_PCM_16BIT,
-        ).coerceAtLeast(sampleRate * channels / 20)
         val format = AudioFormat.Builder()
             .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
             .setSampleRate(sampleRate)
@@ -157,51 +147,177 @@ class FireTVMediaPlayer {
             .setUsage(AudioAttributes.USAGE_MEDIA)
             .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
             .build()
+        val halfSecond = sampleRate * audioChannels * PCM_BYTES_PER_SAMPLE / 2
+        val minimum = AudioTrack.getMinBufferSize(
+            sampleRate,
+            channelMask,
+            AudioFormat.ENCODING_PCM_16BIT,
+        )
         val builder = AudioTrack.Builder()
             .setAudioAttributes(attributes)
             .setAudioFormat(format)
             .setTransferMode(AudioTrack.MODE_STREAM)
-            .setBufferSizeInBytes(minimum * 2)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            builder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+            .setBufferSizeInBytes(maxOf(minimum, halfSecond))
+        synchronized(audioLock) {
+            audioTrack = builder.build()
+            if (encoding == AUDIO_AAC_LC) {
+                val codec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+                val decoderFormat = MediaFormat.createAudioFormat(
+                    MediaFormat.MIMETYPE_AUDIO_AAC,
+                    sampleRate,
+                    audioChannels,
+                ).apply {
+                    setInteger(MediaFormat.KEY_IS_ADTS, 0)
+                    setInteger(MediaFormat.KEY_AAC_PROFILE, 2)
+                    setByteBuffer("csd-0", ByteBuffer.wrap(codecConfig))
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                        setInteger(MediaFormat.KEY_PCM_ENCODING, AudioFormat.ENCODING_PCM_16BIT)
+                    }
+                }
+                codec.configure(decoderFormat, null, null, 0)
+                codec.start()
+                audioDecoder = codec
+            }
         }
-        audioTrack = builder.build().also { it.play() }
+        audioEncoding = encoding
+        audioFramesWritten = 0
+        firstAudioTimestampMilliseconds = null
+        if (requiresPlaybackRecovery) {
+            enterRecovery("audio_codec_changed")
+        }
     }
 
-    fun queueAudio(pcm: ByteArray) {
-        if (!audioWriterRunning.get()) return
-        if (!audioQueue.offerLast(pcm)) {
+    fun queueAudio(data: ByteArray, timestampMilliseconds: Long) {
+        if (!running.get() || audioSampleRate <= 0) return
+        val packet = AudioPacket(data, timestampMilliseconds)
+        if (!audioQueue.offerLast(packet)) {
             audioQueue.pollFirst()
-            audioQueue.offerLast(pcm)
-            Log.w(TAG, "audio queue full; dropped oldest live chunk")
+            audioQueue.offerLast(packet)
+            synchronized(this) { underruns += 1 }
+            Log.w(TAG, "audio queue exceeded the low-latency window")
         }
     }
 
     @Synchronized
     fun reset() {
-        releaseVideo()
+        videoQueue.clear()
+        audioQueue.clear()
+        synchronized(decoderLock) { releaseVideoLocked() }
         releaseAudio()
         videoConfiguration = null
+        waitingForKeyFrame = true
+        firstPlayableVideoTimestampMilliseconds = 0L
+        clock.reset()
     }
 
     @Synchronized
     fun release() {
+        if (!running.compareAndSet(true, false)) return
+        videoWorker.interrupt()
+        audioWorker.interrupt()
+        reportWorker.interrupt()
         reset()
-        audioWriterRunning.set(false)
-        audioWriter.interrupt()
-        surface?.release()
         surface = null
     }
 
-    private fun drainVideo(codec: MediaCodec) {
+    private fun startVideoDecoder() {
+        val configuration = videoConfiguration ?: return
+        val targetSurface = surface ?: return
+        if (!targetSurface.isValid) return
+        synchronized(decoderLock) {
+            releaseVideoLocked()
+            val codec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            val format = MediaFormat.createVideoFormat(
+                MediaFormat.MIMETYPE_VIDEO_AVC,
+                configuration.width,
+                configuration.height,
+            ).apply {
+                setByteBuffer("csd-0", ByteBuffer.wrap(START_CODE + configuration.sps))
+                setByteBuffer("csd-1", ByteBuffer.wrap(START_CODE + configuration.pps))
+                setInteger(MediaFormat.KEY_ROTATION, configuration.rotationDegrees)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+                }
+                setInteger(MediaFormat.KEY_PRIORITY, 0)
+            }
+            codec.configure(format, targetSurface, null, 0)
+            codec.start()
+            decoder = codec
+        }
+    }
+
+    private fun videoLoop() {
+        while (running.get()) {
+            try {
+                val frame = videoQueue.pollFirst(VIDEO_POLL_MILLISECONDS, TimeUnit.MILLISECONDS)
+                if (frame != null && !clock.isStarted()) {
+                    videoQueue.offerFirst(frame)
+                    Thread.sleep(VIDEO_POLL_MILLISECONDS)
+                } else if (frame != null) {
+                    feedVideo(frame)
+                } else {
+                    drainVideo()
+                }
+            } catch (_: InterruptedException) {
+                break
+            } catch (error: Exception) {
+                Log.e(TAG, "video decoder failed", error)
+                enterRecovery("decoder_error")
+            }
+        }
+    }
+
+    private fun feedVideo(frame: VideoFrame) {
+        while (running.get()) {
+            val accepted = synchronized(decoderLock) {
+                val codec = decoder ?: return
+                val inputIndex = codec.dequeueInputBuffer(CODEC_DEQUEUE_MICROSECONDS)
+                if (inputIndex < 0) {
+                    drainVideoLocked(codec)
+                    false
+                } else {
+                    val input = codec.getInputBuffer(inputIndex)
+                    if (input == null || frame.data.size > input.remaining()) {
+                        codec.queueInputBuffer(inputIndex, 0, 0, 0, 0)
+                        enterRecovery("invalid_decoder_buffer")
+                        return
+                    }
+                    input.clear()
+                    input.put(frame.data)
+                    codec.queueInputBuffer(
+                        inputIndex,
+                        0,
+                        frame.data.size,
+                        frame.timestampMilliseconds * 1_000,
+                        if (frame.keyFrame) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0,
+                    )
+                    drainVideoLocked(codec)
+                    true
+                }
+            }
+            if (accepted) return
+        }
+    }
+
+    private fun drainVideo() {
+        synchronized(decoderLock) { decoder?.let(::drainVideoLocked) }
+    }
+
+    private fun drainVideoLocked(codec: MediaCodec) {
         while (true) {
             val outputIndex = codec.dequeueOutputBuffer(outputInfo, 0)
             when {
                 outputIndex >= 0 -> {
-                    codec.releaseOutputBuffer(outputIndex, true)
-                    renderedVideoFrames += 1
-                    if (renderedVideoFrames == 1L || renderedVideoFrames % 120L == 0L) {
-                        Log.d(TAG, "rendered video=$renderedVideoFrames queued=$queuedVideoFrames size=${outputInfo.size}")
+                    val timestampMilliseconds = outputInfo.presentationTimeUs / 1_000
+                    val renderTime = clock.renderTimeNanoseconds(timestampMilliseconds)
+                    if (renderTime == null) {
+                        codec.releaseOutputBuffer(outputIndex, false)
+                    } else if (renderTime < System.nanoTime() - STALE_VIDEO_NANOSECONDS) {
+                        codec.releaseOutputBuffer(outputIndex, false)
+                        synchronized(this) { underruns += 1 }
+                    } else {
+                        codec.releaseOutputBuffer(outputIndex, renderTime)
+                        lastPresentedTimestampMilliseconds = timestampMilliseconds
                     }
                 }
                 outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED ->
@@ -211,7 +327,186 @@ class FireTVMediaPlayer {
         }
     }
 
-    private fun releaseVideo() {
+    private fun audioLoop() {
+        while (running.get()) {
+            try {
+                val packet = audioQueue.pollFirst(
+                    AUDIO_POLL_MILLISECONDS,
+                    TimeUnit.MILLISECONDS,
+                )
+                if (packet == null) {
+                    if (audioEncoding == AUDIO_AAC_LC) {
+                        synchronized(audioLock) { audioDecoder?.let(::drainAudioLocked) }
+                    }
+                    continue
+                }
+                val firstVideoTimestamp = firstPlayableVideoTimestampMilliseconds
+                if (firstVideoTimestamp == 0L) {
+                    // Do not let audio establish the master clock before a
+                    // decodable video keyframe exists. Keep the packet at the
+                    // front so startup remains ordered and bounded.
+                    audioQueue.offerFirst(packet)
+                    Thread.sleep(AUDIO_POLL_MILLISECONDS)
+                    continue
+                }
+                if (packet.timestampMilliseconds <
+                    firstVideoTimestamp - STARTUP_SYNC_TOLERANCE_MILLISECONDS
+                ) {
+                    // Screen/audio capture can begin before VideoToolbox emits
+                    // its first keyframe. Playing that prefix creates a
+                    // permanent A/V offset, so align both streams at the first
+                    // common playable region.
+                    continue
+                }
+                if (audioEncoding == AUDIO_AAC_LC) {
+                    decodeAAC(packet)
+                } else {
+                    writePCM(packet.data, packet.timestampMilliseconds)
+                }
+            } catch (_: InterruptedException) {
+                break
+            } catch (error: IllegalStateException) {
+                Log.w(TAG, "audio track changed while writing", error)
+            }
+        }
+    }
+
+    private fun decodeAAC(packet: AudioPacket) {
+        while (running.get()) {
+            val accepted = synchronized(audioLock) {
+                val codec = audioDecoder ?: return
+                val inputIndex = codec.dequeueInputBuffer(CODEC_DEQUEUE_MICROSECONDS)
+                if (inputIndex < 0) {
+                    drainAudioLocked(codec)
+                    false
+                } else {
+                    val input = codec.getInputBuffer(inputIndex)
+                    if (input == null || packet.data.size > input.remaining()) {
+                        codec.queueInputBuffer(inputIndex, 0, 0, 0, 0)
+                        Log.w(TAG, "AAC access unit did not fit the decoder input")
+                        return
+                    }
+                    input.clear()
+                    input.put(packet.data)
+                    codec.queueInputBuffer(
+                        inputIndex,
+                        0,
+                        packet.data.size,
+                        packet.timestampMilliseconds * 1_000,
+                        0,
+                    )
+                    drainAudioLocked(codec)
+                    true
+                }
+            }
+            if (accepted) return
+        }
+    }
+
+    private fun drainAudioLocked(codec: MediaCodec) {
+        val info = MediaCodec.BufferInfo()
+        while (true) {
+            val outputIndex = codec.dequeueOutputBuffer(info, 0)
+            when {
+                outputIndex >= 0 -> {
+                    val output = codec.getOutputBuffer(outputIndex)
+                    if (output != null && info.size > 0) {
+                        output.position(info.offset)
+                        output.limit(info.offset + info.size)
+                        val pcm = ByteArray(info.size)
+                        output.get(pcm)
+                        writePCM(pcm, info.presentationTimeUs / 1_000)
+                    }
+                    codec.releaseOutputBuffer(outputIndex, false)
+                }
+                outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED ->
+                    Log.d(TAG, "AAC decoder output format=${codec.outputFormat}")
+                else -> return
+            }
+        }
+    }
+
+    private fun writePCM(data: ByteArray, timestampMilliseconds: Long) {
+        val track = synchronized(audioLock) { audioTrack } ?: return
+        if (firstAudioTimestampMilliseconds == null) {
+            firstAudioTimestampMilliseconds = timestampMilliseconds
+        }
+        var offset = 0
+        while (offset < data.size && running.get()) {
+            val written = track.write(
+                data,
+                offset,
+                data.size - offset,
+                AudioTrack.WRITE_BLOCKING,
+            )
+            if (written <= 0) break
+            offset += written
+            audioFramesWritten += written / (audioChannels * PCM_BYTES_PER_SAMPLE)
+        }
+        val bufferedMilliseconds = audioFramesWritten * 1_000 / audioSampleRate
+        if (track.playState != AudioTrack.PLAYSTATE_PLAYING &&
+            bufferedMilliseconds >= TARGET_BUFFER_MILLISECONDS
+        ) {
+            track.play()
+            clock.startAudio(
+                track,
+                firstAudioTimestampMilliseconds ?: timestampMilliseconds,
+            )
+            Log.i(
+                TAG,
+                "playback clock started audio=${firstAudioTimestampMilliseconds ?: timestampMilliseconds} " +
+                    "video=$firstPlayableVideoTimestampMilliseconds buffered=${bufferedMilliseconds}ms",
+            )
+        }
+    }
+
+    private fun enterRecovery(reason: String) {
+        videoQueue.clear()
+        synchronized(this) {
+            waitingForKeyFrame = true
+            recoveries += 1
+        }
+        synchronized(decoderLock) { runCatching { decoder?.flush() } }
+        requestKeyFrame(reason)
+    }
+
+    private fun requestKeyFrame(reason: String) {
+        onKeyFrameNeeded(reason, lastPresentedTimestampMilliseconds)
+    }
+
+    private fun currentReport(): CinemaPlaybackReport {
+        val decoderBacklog = queueDurationMilliseconds(videoQueue.map { it.timestampMilliseconds })
+        val queuedVideo = clock.currentMediaTimestampMilliseconds()?.let { current ->
+            (lastReceivedVideoTimestampMilliseconds - current).coerceAtLeast(0)
+        } ?: decoderBacklog
+        val queuedAudio = queueDurationMilliseconds(audioQueue.map { it.timestampMilliseconds })
+        val trackBuffered = synchronized(audioLock) {
+            val track = audioTrack
+            if (track != null && audioSampleRate > 0) {
+                val played = track.playbackHeadPosition.toLong() and 0xffff_ffffL
+                ((audioFramesWritten - played).coerceAtLeast(0) * 1_000) / audioSampleRate
+            } else 0
+        }
+        return CinemaPlaybackReport(
+            videoBufferMilliseconds = queuedVideo,
+            audioBufferMilliseconds = queuedAudio + trackBuffered,
+            decoderBacklogMilliseconds = decoderBacklog,
+            underruns = synchronized(this) { underruns } + synchronized(audioLock) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    audioTrack?.underrunCount?.toLong() ?: 0
+                } else 0
+            },
+            recoveries = synchronized(this) { recoveries },
+            lastPresentedTimestampMilliseconds = lastPresentedTimestampMilliseconds,
+        )
+    }
+
+    private fun queueDurationMilliseconds(timestamps: List<Long>): Long {
+        if (timestamps.size < 2) return 0
+        return (timestamps.last() - timestamps.first()).coerceAtLeast(0)
+    }
+
+    private fun releaseVideoLocked() {
         decoder?.let { codec ->
             runCatching { codec.stop() }
             runCatching { codec.release() }
@@ -221,21 +516,82 @@ class FireTVMediaPlayer {
 
     @Suppress("DEPRECATION")
     private fun releaseAudio() {
-        audioQueue.clear()
-        audioTrack?.let { track ->
-            runCatching { track.pause() }
-            runCatching { track.flush() }
-            runCatching { track.stop() }
-            runCatching { track.release() }
+        synchronized(audioLock) {
+            audioDecoder?.let { codec ->
+                runCatching { codec.stop() }
+                runCatching { codec.release() }
+            }
+            audioDecoder = null
+            audioTrack?.let { track ->
+                runCatching { track.pause() }
+                runCatching { track.flush() }
+                runCatching { track.stop() }
+                runCatching { track.release() }
+            }
+            audioTrack = null
         }
-        audioTrack = null
+        audioSampleRate = 0
+        audioChannels = 0
+        audioEncoding = 0
+        audioFramesWritten = 0
+        firstAudioTimestampMilliseconds = null
     }
 
-    private companion object {
-        const val TAG = "FireTVMedia"
-        const val MAX_QUEUED_AUDIO_CHUNKS = 10
-        val START_CODE = byteArrayOf(0, 0, 0, 1)
+    private class CinemaClock {
+        private val lock = Any()
+        private var track: AudioTrack? = null
+        private var firstAudioTimestampMilliseconds = 0L
+        private var fallbackRealtimeNanoseconds = 0L
+
+        fun startAudio(track: AudioTrack, timestampMilliseconds: Long) {
+            synchronized(lock) {
+                this.track = track
+                firstAudioTimestampMilliseconds = timestampMilliseconds
+                fallbackRealtimeNanoseconds = System.nanoTime()
+            }
+        }
+
+        fun renderTimeNanoseconds(mediaTimestampMilliseconds: Long): Long? = synchronized(lock) {
+            if (track == null || fallbackRealtimeNanoseconds == 0L) return null
+            // Fire OS can report AudioTimestamp.nanoTime several seconds ahead
+            // of System.nanoTime() even while playback is healthy. SurfaceFlinger
+            // rejects those implausible presentation times, causing visible A/V
+            // separation. AudioTrack starts at this monotonic anchor and runs at
+            // the configured sample rate, so keep the shared media timeline on
+            // the stable monotonic clock.
+            fallbackRealtimeNanoseconds +
+                (mediaTimestampMilliseconds - firstAudioTimestampMilliseconds) * 1_000_000L
+        }
+
+        fun isStarted(): Boolean = synchronized(lock) { track != null }
+
+        fun currentMediaTimestampMilliseconds(): Long? = synchronized(lock) {
+            if (track != null && fallbackRealtimeNanoseconds > 0) {
+                firstAudioTimestampMilliseconds +
+                    (System.nanoTime() - fallbackRealtimeNanoseconds) / 1_000_000L
+            } else {
+                null
+            }
+        }
+
+        fun reset() {
+            synchronized(lock) {
+                track = null
+                fallbackRealtimeNanoseconds = 0
+            }
+        }
     }
+
+    private data class VideoFrame(
+        val data: ByteArray,
+        val timestampMilliseconds: Long,
+        val keyFrame: Boolean,
+    )
+
+    private data class AudioPacket(
+        val data: ByteArray,
+        val timestampMilliseconds: Long,
+    )
 
     private data class VideoConfiguration(
         val width: Int,
@@ -244,4 +600,21 @@ class FireTVMediaPlayer {
         val sps: ByteArray,
         val pps: ByteArray,
     )
+
+    private companion object {
+        const val TAG = "FireTVMedia"
+        const val AUDIO_PCM_16 = 1
+        const val AUDIO_AAC_LC = 2
+        const val PCM_BYTES_PER_SAMPLE = 2
+        const val TARGET_BUFFER_MILLISECONDS = 180L
+        const val STARTUP_SYNC_TOLERANCE_MILLISECONDS = 80L
+        const val REPORT_INTERVAL_MILLISECONDS = 250L
+        const val VIDEO_POLL_MILLISECONDS = 10L
+        const val AUDIO_POLL_MILLISECONDS = 10L
+        const val CODEC_DEQUEUE_MICROSECONDS = 10_000L
+        const val MAX_VIDEO_FRAMES = 120
+        const val MAX_AUDIO_PACKETS = 100
+        const val STALE_VIDEO_NANOSECONDS = 100_000_000L
+        val START_CODE = byteArrayOf(0, 0, 0, 1)
+    }
 }

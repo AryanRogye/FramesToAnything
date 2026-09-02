@@ -1,15 +1,18 @@
 package com.aryanrogye.iosfiretv
 
 import android.app.Activity
+import android.content.Intent
 import android.graphics.Color
-import android.graphics.SurfaceTexture
+import android.media.session.MediaSession
+import android.media.session.PlaybackState
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.view.Gravity
 import android.view.KeyEvent
-import android.view.Surface
-import android.view.TextureView
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import android.view.ViewGroup
 import android.view.View
 import android.widget.Button
@@ -20,8 +23,9 @@ import android.widget.TextView
 
 class MainActivity : Activity(), PairingServer.Listener {
     private lateinit var server: PairingServer
-    private lateinit var textureView: TextureView
+    private lateinit var surfaceView: SurfaceView
     private lateinit var mediaPlayer: FireTVMediaPlayer
+    private lateinit var remoteMediaSession: MediaSession
     private lateinit var statusView: TextView
     private lateinit var codeView: TextView
     private lateinit var instructionsView: TextView
@@ -30,43 +34,37 @@ class MainActivity : Activity(), PairingServer.Listener {
     private lateinit var controlsPanel: LinearLayout
     private lateinit var resetHint: TextView
     private val mainHandler = Handler(Looper.getMainLooper())
+    private var remoteControlsActive = false
+    private var remotePlaybackIsPlaying = true
+    private var lastRemoteCommandTime = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.decorView.keepScreenOn = true
         buildInterface()
-        mediaPlayer = FireTVMediaPlayer()
-        textureView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-            override fun onSurfaceTextureAvailable(
-                surfaceTexture: SurfaceTexture,
-                width: Int,
-                height: Int,
-            ) {
-                mediaPlayer.setSurface(Surface(surfaceTexture))
-            }
-
-            override fun onSurfaceTextureSizeChanged(
-                surfaceTexture: SurfaceTexture,
-                width: Int,
-                height: Int,
-            ) = Unit
-
-            override fun onSurfaceTextureDestroyed(surfaceTexture: SurfaceTexture): Boolean {
-                mediaPlayer.setSurface(null)
-                return true
-            }
-
-            override fun onSurfaceTextureUpdated(surfaceTexture: SurfaceTexture) = Unit
-        }
-        if (textureView.isAvailable) {
-            textureView.surfaceTexture?.let { mediaPlayer.setSurface(Surface(it)) }
-        }
-
         server = PairingServer(applicationContext, this)
+        configureRemoteMediaSession()
+        mediaPlayer = FireTVMediaPlayer(
+            onReport = server::sendReceiverReport,
+            onKeyFrameNeeded = server::requestKeyFrame,
+        )
+        surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
+            override fun surfaceCreated(holder: SurfaceHolder) {
+                mediaPlayer.setSurface(holder.surface)
+            }
+
+            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) = Unit
+
+            override fun surfaceDestroyed(holder: SurfaceHolder) {
+                mediaPlayer.setSurface(null)
+            }
+        })
         server.start()
     }
 
     override fun onDestroy() {
+        remoteMediaSession.isActive = false
+        remoteMediaSession.release()
         server.stop()
         mediaPlayer.release()
         super.onDestroy()
@@ -84,6 +82,16 @@ class MainActivity : Activity(), PairingServer.Listener {
             return true
         }
         return super.onKeyUp(keyCode, event)
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (remoteControlsActive && event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0 &&
+            event.keyCode in REMOTE_MEDIA_KEY_CODES
+        ) {
+            sendPlayPauseToMac()
+            return true
+        }
+        return super.dispatchKeyEvent(event)
     }
 
     override fun onPairingCode(code: String) = runOnUiThread {
@@ -107,6 +115,7 @@ class MainActivity : Activity(), PairingServer.Listener {
             View.GONE
         }
         pairingPanel.visibility = if (streaming) LinearLayout.GONE else LinearLayout.VISIBLE
+        setRemoteControlsActive(streaming)
     }
 
     override fun onVideoConfiguration(
@@ -123,16 +132,22 @@ class MainActivity : Activity(), PairingServer.Listener {
         mediaPlayer.queueVideo(data, timestampMilliseconds, keyFrame)
     }
 
-    override fun onAudioConfiguration(sampleRate: Int, channels: Int) {
-        mediaPlayer.configureAudio(sampleRate, channels)
+    override fun onAudioConfiguration(
+        sampleRate: Int,
+        channels: Int,
+        encoding: Int,
+        codecConfig: ByteArray,
+    ) {
+        mediaPlayer.configureAudio(sampleRate, channels, encoding, codecConfig)
     }
 
-    override fun onAudioFrame(pcm: ByteArray) {
-        mediaPlayer.queueAudio(pcm)
+    override fun onAudioFrame(data: ByteArray, timestampMilliseconds: Long) {
+        mediaPlayer.queueAudio(data, timestampMilliseconds)
     }
 
     override fun onMediaEnded() {
         mediaPlayer.reset()
+        runOnUiThread { setRemoteControlsActive(false) }
     }
 
     private fun buildInterface() {
@@ -140,9 +155,9 @@ class MainActivity : Activity(), PairingServer.Listener {
             setBackgroundColor(Color.rgb(8, 11, 16))
         }
 
-        textureView = TextureView(this).apply { isOpaque = true }
+        surfaceView = SurfaceView(this)
         root.addView(
-            textureView,
+            surfaceView,
             FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -263,6 +278,7 @@ class MainActivity : Activity(), PairingServer.Listener {
         statusView.text = "Restarting receiver…"
         requestProgress.visibility = View.VISIBLE
         mediaPlayer.reset()
+        setRemoteControlsActive(false)
         server.stop()
         controlsPanel.visibility = View.GONE
         mainHandler.postDelayed({
@@ -276,5 +292,79 @@ class MainActivity : Activity(), PairingServer.Listener {
         textSize = size
         setTextColor(color)
         gravity = Gravity.CENTER
+    }
+
+    private fun configureRemoteMediaSession() {
+        remoteMediaSession = MediaSession(this, "FramesFireTVRemote").apply {
+            setCallback(
+                object : MediaSession.Callback() {
+                    override fun onPlay() = sendPlayPauseToMac()
+                    override fun onPause() = sendPlayPauseToMac()
+
+                    @Suppress("DEPRECATION")
+                    override fun onMediaButtonEvent(mediaButtonIntent: Intent): Boolean {
+                        val event = mediaButtonIntent.getParcelableExtra<KeyEvent>(
+                            Intent.EXTRA_KEY_EVENT
+                        ) ?: return false
+                        if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0 &&
+                            event.keyCode in REMOTE_MEDIA_KEY_CODES
+                        ) {
+                            sendPlayPauseToMac()
+                            return true
+                        }
+                        return super.onMediaButtonEvent(mediaButtonIntent)
+                    }
+                },
+                mainHandler,
+            )
+        }
+        updateRemotePlaybackState(playing = true)
+    }
+
+    private fun setRemoteControlsActive(active: Boolean) {
+        remoteControlsActive = active
+        if (active) {
+            remotePlaybackIsPlaying = true
+            updateRemotePlaybackState(playing = true)
+        }
+        remoteMediaSession.isActive = active
+    }
+
+    private fun sendPlayPauseToMac() {
+        if (!remoteControlsActive) return
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastRemoteCommandTime < REMOTE_COMMAND_DEBOUNCE_MILLISECONDS) return
+        lastRemoteCommandTime = now
+        server.sendRemoteMediaCommand(REMOTE_COMMAND_TOGGLE_PLAY_PAUSE)
+        updateRemotePlaybackState(playing = !remotePlaybackIsPlaying)
+    }
+
+    private fun updateRemotePlaybackState(playing: Boolean) {
+        remotePlaybackIsPlaying = playing
+        remoteMediaSession.setPlaybackState(
+            PlaybackState.Builder()
+                .setActions(
+                    PlaybackState.ACTION_PLAY or
+                        PlaybackState.ACTION_PAUSE or
+                        PlaybackState.ACTION_PLAY_PAUSE
+                )
+                .setState(
+                    if (playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED,
+                    PlaybackState.PLAYBACK_POSITION_UNKNOWN,
+                    if (playing) 1f else 0f,
+                )
+                .build()
+        )
+    }
+
+    private companion object {
+        const val REMOTE_COMMAND_TOGGLE_PLAY_PAUSE = "toggle_play_pause"
+        const val REMOTE_COMMAND_DEBOUNCE_MILLISECONDS = 250L
+        val REMOTE_MEDIA_KEY_CODES = setOf(
+            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
+            KeyEvent.KEYCODE_MEDIA_PLAY,
+            KeyEvent.KEYCODE_MEDIA_PAUSE,
+            KeyEvent.KEYCODE_HEADSETHOOK,
+        )
     }
 }

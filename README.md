@@ -76,7 +76,8 @@ The Mac version:
 - Discovers named Fire TV and iPhone/iPad receivers and targets only the selected device.
 - Advertises `_framesmac._tcp` so the Fire TV or iOS receiver can connect to it.
 - Uses the receiver's six-digit code once, then remembers that receiver securely for later sessions.
-- Offers HD, Full HD, QHD, and UHD bitrate presets.
+- Treats HD, Full HD, QHD, and UHD as maximum-quality choices and adapts
+  bitrate first, then resolution, without going below 720p.
 
 Screen Recording permission is required on first launch.
 
@@ -95,7 +96,8 @@ The iPhone/iPad version:
 - Connects to the Mac and performs the same authenticated handshake as the Fire TV receiver.
 - Parses and decrypts framed AES-GCM media records.
 - Converts Annex-B H.264 access units for `AVSampleBufferDisplayLayer` hardware playback.
-- Plays interleaved 16-bit PCM audio with `AVAudioEngine`.
+- Prefers AAC-LC audio and retains interleaved 16-bit PCM as a negotiated fallback.
+- Buffers about 750 ms and presents H.264 frames against the audio/host clock.
 - Provides an embedded preview and a distraction-free full-screen player.
 - Reconnects after interrupted sessions and offers a manual session reset.
 
@@ -111,8 +113,11 @@ The Kotlin Fire TV / Android TV receiver:
 - Displays and rotates a six-digit pairing code.
 - Decrypts media using AES-GCM.
 - Decodes H.264 with Android `MediaCodec` onto a `Surface`.
-- Plays bounded, low-latency PCM audio using `AudioTrack`.
-- Drops stale queued media to keep live playback responsive.
+- Prefers AAC-LC audio and retains PCM as a negotiated fallback.
+- Uses an audio-clocked 750 ms cinema buffer and timestamped `SurfaceView`
+  presentation to avoid partial-frame updates and decoder corruption.
+- For negotiated Mac sessions, routes the Fire TV remote's play/pause button
+  to the Mac system media key so browser video responds normally.
 
 The Android project uses Gradle, Kotlin, and Java 17.
 
@@ -175,19 +180,41 @@ The Mac includes the selected receiver's stable ID in its short-lived Bonjour ad
 
 ## Media pipeline
 
+### Cinema playback
+
+Mac-to-receiver sessions default to a playback-first pipeline:
+
+- The receiver accumulates about 750 ms of audio and video before starting.
+- Audio is the playback clock; video presentation timestamps are scheduled
+  against that clock instead of being displayed immediately on arrival.
+- Sender and receiver queues preserve H.264 dependency order under normal
+  congestion. If a hard bound is exceeded, the receiver flushes once and asks
+  the Mac for a clean keyframe rather than decoding a broken GOP.
+- Receivers report buffer health, decoder backlog, underruns, and recoveries
+  four times per second. The Mac lowers bitrate first, then resolution, and
+  cautiously restores quality after a sustained healthy period.
+- The quality floor is 720p. The picker specifies the ceiling, not a forced
+  resolution.
+
+This remains an ordered, encrypted TCP protocol. Switching transports would
+not remove H.264 frame dependencies; the buffering, clocking, recovery, and
+adaptive policy are what make video playback resilient.
+
 ### Video
 
 - Hardware H.264 encoding and decoding.
 - Up to 60 frames per second.
 - 10 Mbps default Full HD bitrate on macOS.
-- One-second keyframe interval.
+- Half-second keyframe interval for bounded recovery time.
 - Real-time VideoToolbox encoding with B-frames disabled.
 - SPS/PPS configuration followed by Annex-B access units.
-- Bounded queues favoring the newest available frame.
+- Bounded queues preserve ordered frames and recover at a clean keyframe only
+  when a hard limit is reached.
 
 ### Audio
 
-- Interleaved signed 16-bit PCM.
+- AAC-LC at 192 kbps stereo or 96 kbps mono for capable Mac receivers.
+- Interleaved signed 16-bit PCM fallback.
 - Mono or stereo protocol support.
 - App audio from ReplayKit on iOS.
 - System audio from ScreenCaptureKit/SnapCore on macOS.
@@ -233,7 +260,7 @@ Packet types:
 
 | Type | Purpose |
 | --- | --- |
-| `0` | UTF-8 JSON handshake message |
+| `0` | UTF-8 JSON handshake or authenticated receiver-control message |
 | `2` | AES-GCM combined media payload |
 
 An encrypted payload is encoded as:
@@ -258,10 +285,20 @@ Media kinds:
 | --- | --- |
 | `1` | Video width, height, rotation, SPS, and PPS |
 | `2` | Annex-B H.264 access unit |
-| `3` | PCM sample rate, channel count, and encoding |
-| `4` | Interleaved PCM samples |
+| `3` | Audio sample rate, channel count, encoding, and optional codec configuration |
+| `4` | PCM samples or one raw AAC-LC access unit |
 
 The maximum framed media record is 8 MiB. JSON handshake records are limited to 64 KiB.
+
+The handshake advertises optional `cinema-buffer-v1`, `receiver-report-v1`,
+`keyframe-request-v1`, `aac-lc-v1`, and `remote-media-controls-v1`
+capabilities. Older peers continue to use the established PCM media path and
+receive no unnegotiated remote-control messages.
+
+The first remote play/pause command may ask for macOS Accessibility permission.
+Grant it to the Mac sender so it can post the same system media-key event as a
+physical keyboard. Remote commands are accepted only from the currently
+authenticated receiver.
 
 ## Current limitations
 

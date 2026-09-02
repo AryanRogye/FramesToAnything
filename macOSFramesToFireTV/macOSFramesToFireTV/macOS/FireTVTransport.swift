@@ -8,7 +8,7 @@ import OSLog
 import Security
 import SnapCore
 
-private let macTransportLogger = Logger(
+nonisolated private let macTransportLogger = Logger(
     subsystem: "com.aryanrogye.macOSFramesToFireTV",
     category: "MediaTransport"
 )
@@ -17,6 +17,11 @@ struct MacFireTVDevice: Identifiable, Sendable, Equatable {
     let id: String
     let name: String
     let endpoint: NWEndpoint
+    let receiverID: String?
+
+    var isRemembered: Bool {
+        receiverID.map(TrustedReceiverStore.contains) ?? false
+    }
 
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
 }
@@ -25,7 +30,7 @@ enum MacFireTVConnectionState: Sendable, Equatable {
     case searching
     case waitingForReceiver
     case connecting(String)
-    case authenticating
+    case authenticating(Bool)
     case connected(String)
     case failed(String)
     case disconnected
@@ -35,7 +40,8 @@ enum MacFireTVConnectionState: Sendable, Equatable {
         case .searching: "Searching for Fire TV receivers…"
         case .waitingForReceiver: "Waiting for the Fire TV to connect…"
         case .connecting(let name): "Connecting to \(name)…"
-        case .authenticating: "Checking the pairing code…"
+        case .authenticating(let remembered):
+            remembered ? "Recognizing this receiver…" : "Checking the pairing code…"
         case .connected(let name): "Securely connected to \(name)"
         case .failed(let message): message
         case .disconnected: "Not connected"
@@ -82,6 +88,9 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
     private var receiveBuffer = Data()
     private var pairingCode = ""
     private var connectedName = "Fire TV"
+    private var receiverID: String?
+    private var rememberedSecret: Data?
+    private var usedRememberedSecret = false
     private var serverChallenge: Data?
     private var clientChallenge: Data?
     private var handshakeKey: SymmetricKey?
@@ -116,10 +125,13 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
                     guard case .service(let name, _, _, _) = result.endpoint else {
                         return nil
                     }
+                    let receiverID = Self.txtValue("id", from: result)
+                        ?? TrustedReceiverStore.receiverID(forServiceName: name)
                     return MacFireTVDevice(
-                        id: String(describing: result.endpoint),
+                        id: receiverID ?? String(describing: result.endpoint),
                         name: name,
-                        endpoint: result.endpoint
+                        endpoint: result.endpoint,
+                        receiverID: receiverID
                     )
                 }
                 .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
@@ -130,15 +142,65 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
     }
 
     func connect(to device: MacFireTVDevice, code: String) {
-        waitForFireTV(code: code)
+        waitForReceiver(device: device, code: code)
+    }
+
+    func connectDirect(host: String, code: String) {
+        let normalizedCode = code.filter(\.isNumber)
+        guard normalizedCode.count == 6 else {
+            report(.failed("Enter the six-digit code shown on the Fire TV."))
+            return
+        }
+        let endpoint = NWEndpoint.hostPort(
+            host: NWEndpoint.Host(host),
+            port: NWEndpoint.Port(rawValue: 49_218)!
+        )
+        networkQueue.async { [weak self] in
+            guard let self else { return }
+            connection?.cancel()
+            listener?.cancel()
+            listener = nil
+            clearSession()
+            mediaEncoder.restart()
+            pairingCode = normalizedCode
+            connectedName = "Fire TV at \(host)"
+
+            let parameters = NWParameters.tcp
+            if let tcpOptions = parameters.defaultProtocolStack.transportProtocol
+                as? NWProtocolTCP.Options {
+                tcpOptions.noDelay = true
+            }
+            let connection = NWConnection(to: endpoint, using: parameters)
+            self.connection = connection
+            report(.connecting(connectedName))
+            connection.stateUpdateHandler = { [weak self, weak connection] state in
+                guard let self, let connection, connection === self.connection else { return }
+                switch state {
+                case .ready:
+                    self.receiveNextChunk(from: connection)
+                case .failed(let error):
+                    self.fail("Connection failed: \(error.localizedDescription)")
+                case .cancelled:
+                    self.report(.disconnected)
+                default:
+                    break
+                }
+            }
+            connection.start(queue: networkQueue)
+        }
     }
 
     /// Advertises a short-lived pairing listener. The Fire TV initiates the
     /// TCP connection, while the existing authenticated media protocol remains
     /// unchanged once the socket is accepted.
     func waitForFireTV(code: String) {
+        waitForReceiver(device: nil, code: code)
+    }
+
+    private func waitForReceiver(device: MacFireTVDevice?, code: String) {
         let normalizedCode = code.filter(\.isNumber)
-        guard normalizedCode.count == 6 else {
+        let savedSecret = device?.receiverID.flatMap(TrustedReceiverStore.load)
+        guard savedSecret != nil || normalizedCode.count == 6 else {
             report(.failed("Enter the six-digit code shown on the Fire TV."))
             return
         }
@@ -149,7 +211,10 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
             clearSession()
             mediaEncoder.restart()
             pairingCode = normalizedCode
-            connectedName = "Fire TV"
+            connectedName = device?.name ?? "Receiver"
+            receiverID = device?.receiverID
+            rememberedSecret = savedSecret
+            usedRememberedSecret = false
 
             do {
                 let parameters = NWParameters.tcp
@@ -159,9 +224,16 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
                     tcpOptions.noDelay = true
                 }
                 let listener = try NWListener(using: parameters)
+                var serviceTXT = NWTXTRecord([
+                    "senderID": Self.senderID,
+                ])
+                if let receiverID = device?.receiverID {
+                    serviceTXT["target"] = receiverID
+                }
                 listener.service = .init(
                     name: Host.current().localizedName ?? "Mac",
-                    type: "_framesmac._tcp"
+                    type: "_framesmac._tcp",
+                    txtRecord: serviceTXT
                 )
                 self.listener = listener
                 listener.stateUpdateHandler = { [weak self, weak listener] state in
@@ -182,14 +254,12 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
                         return
                     }
                     self.connection = connection
-                    self.listener?.cancel()
-                    self.listener = nil
-                    self.report(.connecting("Fire TV"))
+                    self.report(.connecting(self.connectedName))
                     connection.stateUpdateHandler = { [weak self, weak connection] state in
-                        guard let self, connection === self.connection else { return }
+                        guard let self, let connection, connection === self.connection else { return }
                         switch state {
                         case .ready:
-                            self.receiveNextChunk()
+                            self.receiveNextChunk(from: connection)
                         case .failed(let error):
                             self.fail("Connection failed: \(error.localizedDescription)")
                         case .cancelled:
@@ -245,12 +315,12 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
         mediaEncoder.encodeAudio(sampleBuffer)
     }
 
-    private func receiveNextChunk() {
-        connection?.receive(
+    private func receiveNextChunk(from connection: NWConnection) {
+        connection.receive(
             minimumIncompleteLength: 1,
             maximumLength: 64 * 1024
-        ) { [weak self] data, _, isComplete, error in
-            guard let self else { return }
+        ) { [weak self, weak connection] data, _, isComplete, error in
+            guard let self, let connection, connection === self.connection else { return }
             if let data, !data.isEmpty {
                 receiveBuffer.append(data)
                 processPackets()
@@ -260,7 +330,7 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
             } else if isComplete {
                 fail("The Fire TV ended the connection.")
             } else {
-                receiveNextChunk()
+                receiveNextChunk(from: connection)
             }
         }
     }
@@ -296,17 +366,44 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
                   let challengeValue = object["challenge"] as? String,
                   let salt = Data(base64Encoded: saltValue),
                   let serverChallenge = Data(base64Encoded: challengeValue),
-                  serverChallenge.count == 32,
-                  let keyData = Self.deriveKey(code: pairingCode, salt: salt) else {
+                  serverChallenge.count == 32 else {
                 fail("The receiver uses an unsupported authentication protocol.")
                 return
             }
             let clientChallenge = Self.randomData(count: 32)
+            let helloReceiverID = object["receiverID"] as? String
+            if let expectedID = receiverID,
+               let helloReceiverID,
+               expectedID != helloReceiverID {
+                rejectUnexpectedReceiver()
+                return
+            }
+            receiverID = helloReceiverID ?? receiverID
+            let trustedSecret = rememberedSecret
+            let keyData: Data?
+            let mode: String
+            if let trustedSecret {
+                keyData = Self.deriveRememberedSessionKey(
+                    secret: trustedSecret,
+                    salt: salt,
+                    serverChallenge: serverChallenge,
+                    clientChallenge: clientChallenge
+                )
+                mode = "remembered"
+                usedRememberedSecret = true
+            } else {
+                keyData = Self.deriveKey(code: pairingCode, salt: salt)
+                mode = "code"
+            }
+            guard let keyData else {
+                fail("Could not create a secure session key.")
+                return
+            }
             let key = SymmetricKey(data: keyData)
             self.serverChallenge = serverChallenge
             self.clientChallenge = clientChallenge
             handshakeKey = key
-            report(.authenticating)
+            report(.authenticating(usedRememberedSecret))
             let proof = Self.authenticationCode(
                 key: key,
                 label: "client",
@@ -316,6 +413,8 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
             sendJSON([
                 "type": "auth",
                 "name": Host.current().localizedName ?? "Mac",
+                "senderID": Self.senderID,
+                "mode": mode,
                 "challenge": clientChallenge.base64EncodedString(),
                 "proof": proof.base64EncodedString(),
             ])
@@ -339,11 +438,32 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
                 fail("The Fire TV identity check failed.")
                 return
             }
+            if !usedRememberedSecret, let receiverID {
+                let secret = Self.deriveTrustSecret(
+                    key: key,
+                    serverChallenge: serverChallenge,
+                    clientChallenge: clientChallenge
+                )
+                TrustedReceiverStore.save(secret, for: receiverID)
+            }
+            if let receiverID {
+                TrustedReceiverStore.associate(
+                    receiverID: receiverID,
+                    withServiceName: connectedName
+                )
+            }
+            listener?.cancel()
+            listener = nil
             setStreamingKey(key)
             report(.connected(connectedName))
 
         case "auth_failed":
-            fail("That pairing code was not accepted. The Fire TV has generated a new code.")
+            if usedRememberedSecret, let receiverID {
+                TrustedReceiverStore.delete(receiverID)
+                fail("This receiver no longer remembers your Mac. Enter its current code once to pair again.")
+            } else {
+                fail("That pairing code was not accepted. The receiver has generated a new code.")
+            }
         default:
             break
         }
@@ -444,8 +564,8 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
 
     private func write(_ packet: QueuedPacket, using connection: NWConnection) {
         writeInFlight = true
-        connection.send(content: packet.data, completion: .contentProcessed { [weak self] error in
-            guard let self else { return }
+        connection.send(content: packet.data, completion: .contentProcessed { [weak self, weak connection] error in
+            guard let self, let connection, connection === self.connection else { return }
             writeInFlight = false
             if let error {
                 fail("Could not send media: \(error.localizedDescription)")
@@ -469,9 +589,24 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
         report(.failed(message))
     }
 
+    private func rejectUnexpectedReceiver() {
+        let unexpectedConnection = connection
+        connection = nil
+        unexpectedConnection?.cancel()
+        clearHandshakeState()
+        report(.waitingForReceiver)
+    }
+
     private func clearSession() {
-        receiveBuffer.removeAll(keepingCapacity: true)
+        clearHandshakeState()
         pairingCode = ""
+        receiverID = nil
+        rememberedSecret = nil
+        usedRememberedSecret = false
+    }
+
+    private func clearHandshakeState() {
+        receiveBuffer.removeAll(keepingCapacity: true)
         serverChallenge = nil
         clientChallenge = nil
         handshakeKey = nil
@@ -521,6 +656,48 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
         return status == kCCSuccess ? derived : nil
     }
 
+    private static func deriveRememberedSessionKey(
+        secret: Data,
+        salt: Data,
+        serverChallenge: Data,
+        clientChallenge: Data
+    ) -> Data {
+        var message = Data("session".utf8)
+        message.append(salt)
+        message.append(serverChallenge)
+        message.append(clientChallenge)
+        return Data(HMAC<SHA256>.authenticationCode(
+            for: message,
+            using: SymmetricKey(data: secret)
+        ))
+    }
+
+    private static func deriveTrustSecret(
+        key: SymmetricKey,
+        serverChallenge: Data,
+        clientChallenge: Data
+    ) -> Data {
+        var message = Data("remember-receiver".utf8)
+        message.append(serverChallenge)
+        message.append(clientChallenge)
+        return Data(HMAC<SHA256>.authenticationCode(for: message, using: key))
+    }
+
+    private static func txtValue(_ key: String, from result: NWBrowser.Result) -> String? {
+        guard case .bonjour(let record) = result.metadata,
+              case .string(let value) = record.getEntry(for: key),
+              !value.isEmpty else { return nil }
+        return value
+    }
+
+    private static let senderID: String = {
+        let key = "discovery.senderID"
+        if let value = UserDefaults.standard.string(forKey: key) { return value }
+        let value = UUID().uuidString.lowercased()
+        UserDefaults.standard.set(value, forKey: key)
+        return value
+    }()
+
     private static func authenticationCode(
         key: SymmetricKey,
         label: String,
@@ -556,6 +733,88 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
     private static let mediaVersion: UInt8 = 2
     private static let maximumJSONPacketBytes: UInt32 = 64 * 1024
     private static let maximumPendingAudioPackets = 12
+}
+
+private enum TrustedReceiverStore {
+    nonisolated private static let service = "com.aryanrogye.macOSFramesToFireTV.remembered-receivers"
+    nonisolated private static let serviceNameMapKey = "discovery.rememberedReceiverIDs"
+    nonisolated private static let fallbackSecretPrefix = "discovery.rememberedReceiverSecret."
+
+    nonisolated static func contains(_ receiverID: String) -> Bool {
+        load(receiverID) != nil
+    }
+
+    nonisolated static func load(_ receiverID: String) -> Data? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: receiverID,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var result: CFTypeRef?
+        if SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+           let data = result as? Data {
+            return data
+        }
+        guard let value = UserDefaults.standard.string(
+            forKey: fallbackSecretPrefix + receiverID
+        ) else { return nil }
+        return Data(base64Encoded: value)
+    }
+
+    nonisolated static func save(_ secret: Data, for receiverID: String) {
+        let lookup: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: receiverID,
+        ]
+        let attributes = [kSecValueData as String: secret]
+        let updateStatus = SecItemUpdate(lookup as CFDictionary, attributes as CFDictionary)
+        let saveStatus: OSStatus
+        if updateStatus == errSecItemNotFound {
+            var item = lookup
+            item[kSecValueData as String] = secret
+            saveStatus = SecItemAdd(item as CFDictionary, nil)
+        } else {
+            saveStatus = updateStatus
+        }
+        if saveStatus == errSecSuccess {
+            UserDefaults.standard.removeObject(forKey: fallbackSecretPrefix + receiverID)
+        } else {
+            UserDefaults.standard.set(
+                secret.base64EncodedString(),
+                forKey: fallbackSecretPrefix + receiverID
+            )
+        }
+    }
+
+    nonisolated static func associate(receiverID: String, withServiceName serviceName: String) {
+        var mappings = UserDefaults.standard.dictionary(forKey: serviceNameMapKey) as? [String: String]
+            ?? [:]
+        mappings[serviceName] = receiverID
+        UserDefaults.standard.set(mappings, forKey: serviceNameMapKey)
+    }
+
+    nonisolated static func receiverID(forServiceName serviceName: String) -> String? {
+        let mappings = UserDefaults.standard.dictionary(forKey: serviceNameMapKey) as? [String: String]
+        return mappings?[serviceName]
+    }
+
+    nonisolated static func delete(_ receiverID: String) {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: receiverID,
+        ]
+        SecItemDelete(query as CFDictionary)
+        UserDefaults.standard.removeObject(forKey: fallbackSecretPrefix + receiverID)
+        if var mappings = UserDefaults.standard.dictionary(forKey: serviceNameMapKey)
+            as? [String: String] {
+            mappings = mappings.filter { $0.value != receiverID }
+            UserDefaults.standard.set(mappings, forKey: serviceNameMapKey)
+        }
+    }
 }
 
 private extension Data {

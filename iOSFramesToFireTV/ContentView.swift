@@ -18,7 +18,7 @@ struct ContentView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
-                    Text("Choose your TV, pair with its current code, then start the system broadcast.")
+                    Text("Choose your TV. Enter its code once, then reconnect without it on later broadcasts.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
 
@@ -44,6 +44,11 @@ struct ContentView: View {
                                         Text(device.name)
                                             .fontWeight(.medium)
                                         Spacer()
+                                        if device.isRemembered {
+                                            Image(systemName: "checkmark.shield.fill")
+                                                .foregroundStyle(.green)
+                                                .accessibilityLabel("Remembered Fire TV")
+                                        }
                                         Image(
                                             systemName: model.selectedDevice?.id == device.id
                                                 ? "checkmark.circle.fill"
@@ -83,33 +88,46 @@ struct ContentView: View {
 
                         Divider()
 
-                        StepHeader(number: 2, title: "Enter the pairing code")
+                        StepHeader(
+                            number: 2,
+                            title: model.selectedDevice?.isRemembered == true
+                                ? "Connect to your TV"
+                                : "Enter the pairing code"
+                        )
 
-                        TextField("000000", text: $model.pairingCode)
-                            .keyboardType(.numberPad)
-                            .textContentType(.oneTimeCode)
-                            .font(.system(size: 32, weight: .semibold, design: .rounded))
-                            .monospacedDigit()
-                            .multilineTextAlignment(.center)
-                            .focused($isPairingCodeFocused)
-                            .padding(.vertical, 13)
-                            .background(Color(uiColor: .tertiarySystemFill))
-                            .clipShape(RoundedRectangle(cornerRadius: 14))
-                            .overlay {
-                                RoundedRectangle(cornerRadius: 14)
-                                    .stroke(
-                                        isPairingCodeFocused
-                                            ? Color.accentColor
-                                            : Color.clear,
-                                        lineWidth: 2
-                                    )
-                            }
-                            .onChange(of: model.pairingCode) { _, newValue in
-                                let digits = String(newValue.filter(\.isNumber).prefix(6))
-                                if digits != newValue {
-                                    model.pairingCode = digits
+                        if model.selectedDevice?.isRemembered == true {
+                            Label(
+                                "This Fire TV remembers your iPhone. No code needed.",
+                                systemImage: "checkmark.shield.fill"
+                            )
+                            .foregroundStyle(.green)
+                        } else {
+                            TextField("000000", text: $model.pairingCode)
+                                .keyboardType(.numberPad)
+                                .textContentType(.oneTimeCode)
+                                .font(.system(size: 32, weight: .semibold, design: .rounded))
+                                .monospacedDigit()
+                                .multilineTextAlignment(.center)
+                                .focused($isPairingCodeFocused)
+                                .padding(.vertical, 13)
+                                .background(Color(uiColor: .tertiarySystemFill))
+                                .clipShape(RoundedRectangle(cornerRadius: 14))
+                                .overlay {
+                                    RoundedRectangle(cornerRadius: 14)
+                                        .stroke(
+                                            isPairingCodeFocused
+                                                ? Color.accentColor
+                                                : Color.clear,
+                                            lineWidth: 2
+                                        )
                                 }
-                            }
+                                .onChange(of: model.pairingCode) { _, newValue in
+                                    let digits = String(newValue.filter(\.isNumber).prefix(6))
+                                    if digits != newValue {
+                                        model.pairingCode = digits
+                                    }
+                                }
+                        }
 
                         Button {
                             isPairingCodeFocused = false
@@ -118,8 +136,14 @@ struct ContentView: View {
                                 .notificationOccurred(.success)
                         } label: {
                             Label(
-                                model.isPaired ? "Paired and ready" : "Pair with Fire TV",
-                                systemImage: model.isPaired ? "checkmark.shield.fill" : "lock.shield"
+                                model.isPaired
+                                    ? "Ready to broadcast"
+                                    : (model.selectedDevice?.isRemembered == true
+                                        ? "Use Remembered Fire TV"
+                                        : "Pair with Fire TV"),
+                                systemImage: model.isPaired || model.selectedDevice?.isRemembered == true
+                                    ? "checkmark.shield.fill"
+                                    : "lock.shield"
                             )
                             .frame(maxWidth: .infinity)
                         }
@@ -237,17 +261,20 @@ final class ViewModel {
 
         transport.onDevicesChanged = { [weak self] devices in
             self?.devices = devices
-            if let selected = self?.selectedDevice,
-               !devices.contains(where: { $0.id == selected.id }) {
-                self?.selectedDevice = nil
-                self?.invalidatePairing()
+            if let selected = self?.selectedDevice {
+                if let refreshed = devices.first(where: { $0.id == selected.id }) {
+                    self?.selectedDevice = refreshed
+                } else {
+                    self?.selectedDevice = nil
+                    self?.invalidatePairing()
+                }
             }
         }
     }
 
     var canPair: Bool {
         (selectedDevice != nil || !manualAddress.trimmingCharacters(in: .whitespaces).isEmpty) &&
-            pairingCode.filter(\.isNumber).count == 6
+            (selectedDevice?.isRemembered == true || pairingCode.filter(\.isNumber).count == 6)
     }
 
     func startDiscovery() {
@@ -292,9 +319,15 @@ final class ViewModel {
 
         if let selectedDevice {
             defaults.set(selectedDevice.name, forKey: "broadcast.serviceName")
+            if let receiverID = selectedDevice.receiverID {
+                defaults.set(receiverID, forKey: "broadcast.receiverID")
+            } else {
+                defaults.removeObject(forKey: "broadcast.receiverID")
+            }
             defaults.removeObject(forKey: "broadcast.manualHost")
         } else {
             defaults.removeObject(forKey: "broadcast.serviceName")
+            defaults.removeObject(forKey: "broadcast.receiverID")
             defaults.set(
                 manualAddress.trimmingCharacters(in: .whitespacesAndNewlines),
                 forKey: "broadcast.manualHost"
@@ -318,6 +351,7 @@ final class ViewModel {
         defaults.removeObject(forKey: "broadcast.serviceName")
         defaults.removeObject(forKey: "broadcast.manualHost")
         defaults.removeObject(forKey: "broadcast.pairingCode")
+        defaults.removeObject(forKey: "broadcast.receiverID")
     }
 }
 

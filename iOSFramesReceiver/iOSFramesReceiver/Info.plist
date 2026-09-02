@@ -22,6 +22,7 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>NSBonjourServices</key>
 	<array>
+		<string>_iosfiretv._tcp</string>
 		<string>_framesmac._tcp</string>
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>

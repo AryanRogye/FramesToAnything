@@ -22,10 +22,16 @@ protocol SampleBufferTransport: AnyObject {
     )
 }
 
-struct FireTVDevice: Identifiable, Sendable {
+struct FireTVDevice: Identifiable, Sendable, Equatable {
     let id: String
     let name: String
     fileprivate let endpoint: NWEndpoint
+    let receiverID: String?
+    let isRemembered: Bool
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.id == rhs.id && lhs.name == rhs.name && lhs.isRemembered == rhs.isRemembered
+    }
 }
 
 enum FireTVConnectionState: Sendable, Equatable {
@@ -113,10 +119,13 @@ nonisolated final class Transport: SampleBufferTransport, @unchecked Sendable {
                     guard case .service(let name, _, _, _) = result.endpoint else {
                         return nil
                     }
+                    let receiverID = Self.txtValue("id", from: result)
                     return FireTVDevice(
-                        id: String(describing: result.endpoint),
+                        id: receiverID ?? String(describing: result.endpoint),
                         name: name,
-                        endpoint: result.endpoint
+                        endpoint: result.endpoint,
+                        receiverID: receiverID,
+                        isRemembered: receiverID.map(SharedRememberedReceiverStore.contains) ?? false
                     )
                 }
                 .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
@@ -381,6 +390,13 @@ nonisolated final class Transport: SampleBufferTransport, @unchecked Sendable {
         Task { @MainActor in callback?(devices) }
     }
 
+    private static func txtValue(_ key: String, from result: NWBrowser.Result) -> String? {
+        guard case .bonjour(let record) = result.metadata,
+              case .string(let value) = record.getEntry(for: key),
+              !value.isEmpty else { return nil }
+        return value
+    }
+
     private static func deriveKey(code: String, salt: Data) -> Data? {
         let passwordLength = code.lengthOfBytes(using: .utf8)
         let derivedCount = 32
@@ -434,6 +450,21 @@ nonisolated final class Transport: SampleBufferTransport, @unchecked Sendable {
     private static let maximumPacketBytes: UInt32 = 64 * 1024
     private static let maximumFramesPerSecond = 12.0
     private static let jpegQuality = 0.62
+}
+
+nonisolated enum SharedRememberedReceiverStore {
+    static let appGroup = "group.com.aryanrogye.iOSFramesToFireTV"
+    private static let prefix = "trusted.receiver."
+
+    static func contains(_ receiverID: String) -> Bool {
+        load(receiverID) != nil
+    }
+
+    static func load(_ receiverID: String) -> Data? {
+        guard let value = UserDefaults(suiteName: appGroup)?
+            .string(forKey: prefix + receiverID) else { return nil }
+        return Data(base64Encoded: value)
+    }
 }
 
 final class IOSScreenStreamer {

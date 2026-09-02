@@ -10,23 +10,30 @@ import SnapCore
 struct BroadcastConfiguration: Sendable {
     let serviceName: String?
     let manualHost: String?
-    let pairingCode: String
+    let receiverID: String?
+    let pairingCode: String?
+    let rememberedSecret: Data?
 
     static func load() -> BroadcastConfiguration? {
-        guard let defaults = UserDefaults(suiteName: appGroup),
-              let pairingCode = defaults.string(forKey: pairingCodeKey),
-              pairingCode.count == 6 else {
+        guard let defaults = UserDefaults(suiteName: appGroup) else {
             return nil
         }
         let serviceName = defaults.string(forKey: serviceNameKey)
         let manualHost = defaults.string(forKey: manualHostKey)
+        let receiverID = defaults.string(forKey: receiverIDKey)
+        let pairingCode = defaults.string(forKey: pairingCodeKey)
+            .flatMap { $0.count == 6 ? $0 : nil }
+        let rememberedSecret = receiverID.flatMap(BroadcastRememberedReceiverStore.load)
         guard serviceName?.isEmpty == false || manualHost?.isEmpty == false else {
             return nil
         }
+        guard rememberedSecret != nil || pairingCode != nil else { return nil }
         return BroadcastConfiguration(
             serviceName: serviceName,
             manualHost: manualHost,
-            pairingCode: pairingCode
+            receiverID: receiverID,
+            pairingCode: pairingCode,
+            rememberedSecret: rememberedSecret
         )
     }
 
@@ -34,6 +41,7 @@ struct BroadcastConfiguration: Sendable {
     private static let serviceNameKey = "broadcast.serviceName"
     private static let manualHostKey = "broadcast.manualHost"
     private static let pairingCodeKey = "broadcast.pairingCode"
+    private static let receiverIDKey = "broadcast.receiverID"
 }
 
 /// A self-contained sender owned by the ReplayKit extension process. The host
@@ -55,6 +63,7 @@ nonisolated final class BroadcastTransport: @unchecked Sendable {
     private var serverChallenge: Data?
     private var clientChallenge: Data?
     private var handshakeKey: SymmetricKey?
+    private var usedRememberedSecret = false
     private var streamingKey: SymmetricKey?
     private var writeInFlight = false
     private var pendingPackets: [QueuedPacket] = []
@@ -168,6 +177,10 @@ nonisolated final class BroadcastTransport: @unchecked Sendable {
         browser.browseResultsChangedHandler = { [weak self] results, _ in
             guard let self else { return }
             guard let endpoint = results.first(where: { result in
+                if let receiverID = self.configuration.receiverID,
+                   let foundID = Self.txtValue("id", from: result) {
+                    return receiverID == foundID
+                }
                 guard case .service(let name, _, _, _) = result.endpoint else {
                     return false
                 }
@@ -262,16 +275,42 @@ nonisolated final class BroadcastTransport: @unchecked Sendable {
                   let challengeString = object["challenge"] as? String,
                   let salt = Data(base64Encoded: saltString),
                   let serverChallenge = Data(base64Encoded: challengeString),
-                  serverChallenge.count == 32,
-                  let keyData = Self.deriveKey(
-                    code: configuration.pairingCode,
-                    salt: salt
-                  ) else {
+                  serverChallenge.count == 32 else {
                 fail("The Fire TV uses an unsupported authentication protocol.")
                 return
             }
 
             let clientChallenge = Self.randomData(count: 32)
+            let helloReceiverID = object["receiverID"] as? String
+            if let expectedID = configuration.receiverID,
+               let helloReceiverID,
+               expectedID != helloReceiverID {
+                fail("A different Fire TV answered the broadcast request.")
+                return
+            }
+            let keyData: Data?
+            let mode: String
+            if let secret = configuration.rememberedSecret {
+                keyData = Self.deriveRememberedSessionKey(
+                    secret: secret,
+                    salt: salt,
+                    serverChallenge: serverChallenge,
+                    clientChallenge: clientChallenge
+                )
+                mode = "remembered"
+                usedRememberedSecret = true
+            } else if let code = configuration.pairingCode {
+                keyData = Self.deriveKey(code: code, salt: salt)
+                mode = "code"
+                usedRememberedSecret = false
+            } else {
+                keyData = nil
+                mode = "code"
+            }
+            guard let keyData else {
+                fail("Open the sender app and pair with this Fire TV again.")
+                return
+            }
             let key = SymmetricKey(data: keyData)
             self.serverChallenge = serverChallenge
             self.clientChallenge = clientChallenge
@@ -285,6 +324,9 @@ nonisolated final class BroadcastTransport: @unchecked Sendable {
             )
             sendJSON([
                 "type": "auth",
+                "name": "iPhone or iPad",
+                "senderID": BroadcastRememberedReceiverStore.senderID,
+                "mode": mode,
                 "challenge": clientChallenge.base64EncodedString(),
                 "proof": proof.base64EncodedString(),
             ])
@@ -308,10 +350,23 @@ nonisolated final class BroadcastTransport: @unchecked Sendable {
                 fail("The Fire TV identity check failed.")
                 return
             }
+            if !usedRememberedSecret, let receiverID = configuration.receiverID {
+                let secret = Self.deriveTrustSecret(
+                    key: key,
+                    serverChallenge: serverChallenge,
+                    clientChallenge: clientChallenge
+                )
+                BroadcastRememberedReceiverStore.save(secret, for: receiverID)
+            }
             setStreamingKey(key)
 
         case "auth_failed":
-            fail("The Fire TV rejected the pairing code. Reopen the sender app and enter the new TV code.")
+            if usedRememberedSecret, let receiverID = configuration.receiverID {
+                BroadcastRememberedReceiverStore.delete(receiverID)
+                fail("This Fire TV needs to pair again. Reopen the sender app and enter its current code once.")
+            } else {
+                fail("The Fire TV rejected the pairing code. Reopen the sender app and enter the new TV code.")
+            }
 
         default:
             break
@@ -392,6 +447,7 @@ nonisolated final class BroadcastTransport: @unchecked Sendable {
         serverChallenge = nil
         clientChallenge = nil
         handshakeKey = nil
+        usedRememberedSecret = false
         writeInFlight = false
         pendingPackets.removeAll(keepingCapacity: true)
         latestVideoPacket = nil
@@ -428,6 +484,40 @@ nonisolated final class BroadcastTransport: @unchecked Sendable {
             }
         }
         return status == kCCSuccess ? derived : nil
+    }
+
+    private static func deriveRememberedSessionKey(
+        secret: Data,
+        salt: Data,
+        serverChallenge: Data,
+        clientChallenge: Data
+    ) -> Data {
+        var message = Data("session".utf8)
+        message.append(salt)
+        message.append(serverChallenge)
+        message.append(clientChallenge)
+        return Data(HMAC<SHA256>.authenticationCode(
+            for: message,
+            using: SymmetricKey(data: secret)
+        ))
+    }
+
+    private static func deriveTrustSecret(
+        key: SymmetricKey,
+        serverChallenge: Data,
+        clientChallenge: Data
+    ) -> Data {
+        var message = Data("remember-receiver".utf8)
+        message.append(serverChallenge)
+        message.append(clientChallenge)
+        return Data(HMAC<SHA256>.authenticationCode(for: message, using: key))
+    }
+
+    private static func txtValue(_ key: String, from result: NWBrowser.Result) -> String? {
+        guard case .bonjour(let record) = result.metadata,
+              case .string(let value) = record.getEntry(for: key),
+              !value.isEmpty else { return nil }
+        return value
     }
 
     private static func authenticationCode(
@@ -483,4 +573,37 @@ nonisolated final class BroadcastTransport: @unchecked Sendable {
     private static let mediaVersion: UInt8 = 2
     private static let maximumJSONPacketBytes: UInt32 = 64 * 1024
     private static let maximumPendingPackets = 24
+}
+
+nonisolated private enum BroadcastRememberedReceiverStore {
+    private static let appGroup = "group.com.aryanrogye.iOSFramesToFireTV"
+    private static let prefix = "trusted.receiver."
+
+    static var senderID: String {
+        guard let defaults = UserDefaults(suiteName: appGroup) else {
+            return UUID().uuidString.lowercased()
+        }
+        let key = "broadcast.senderID"
+        if let value = defaults.string(forKey: key) { return value }
+        let value = UUID().uuidString.lowercased()
+        defaults.set(value, forKey: key)
+        return value
+    }
+
+    static func load(_ receiverID: String) -> Data? {
+        guard let value = UserDefaults(suiteName: appGroup)?
+            .string(forKey: prefix + receiverID) else { return nil }
+        return Data(base64Encoded: value)
+    }
+
+    static func save(_ secret: Data, for receiverID: String) {
+        UserDefaults(suiteName: appGroup)?.set(
+            secret.base64EncodedString(),
+            forKey: prefix + receiverID
+        )
+    }
+
+    static func delete(_ receiverID: String) {
+        UserDefaults(suiteName: appGroup)?.removeObject(forKey: prefix + receiverID)
+    }
 }

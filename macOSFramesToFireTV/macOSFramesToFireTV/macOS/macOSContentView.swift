@@ -1,217 +1,167 @@
 #if os(macOS)
 
+import AppKit
 import Observation
 import Network
 import SnapCore
 import SwiftUI
 
-struct MacContentView: View {
-    @State private var model = MacStreamingModel()
-    @FocusState private var focusedField: Field?
+enum MacPairingWindow {
+    static let id = "pair-receiver"
+}
 
-    private enum Field { case address, code }
+struct MacMenuBarContent: View {
+    @Bindable var model: MacStreamingModel
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        HSplitView {
-            receiverSidebar
-                .frame(minWidth: 245, idealWidth: 270, maxWidth: 320)
+        Label(model.statusMessage, systemImage: model.statusSymbol)
 
-            streamPanel
-                .frame(minWidth: 430, maxWidth: .infinity, maxHeight: .infinity)
+        Divider()
+
+        Section("Receivers") {
+            if model.devices.isEmpty {
+                Text("Searching on this Wi-Fi network…")
+            } else {
+                ForEach(model.devices) { device in
+                    Button {
+                        connect(to: device)
+                    } label: {
+                        Label(
+                            device.name,
+                            systemImage: device.isRemembered
+                                ? "checkmark.shield.fill"
+                                : model.deviceSymbol(for: device)
+                        )
+                    }
+                    .disabled(model.isStreaming || model.isBusy)
+                }
+            }
+
+            Button("Connect by IP Address…", systemImage: "network") {
+                model.prepareManualPairing()
+                showPairingWindow()
+            }
+            .disabled(model.isStreaming || model.isBusy)
         }
-        .frame(minWidth: 720, minHeight: 520)
-        .background(Color(nsColor: .windowBackgroundColor))
-        .onAppear { model.startDiscovery() }
-        .onDisappear { model.stop() }
+
+        Section("Stream") {
+            Picker("Quality", selection: $model.selectedQuality) {
+                ForEach(MacStreamQuality.allCases) { quality in
+                    Text("\(quality.label) · \(quality.bandwidth)")
+                        .tag(quality)
+                }
+            }
+            .disabled(model.isStreaming)
+
+            if model.isStreaming {
+                Button("Stop Streaming", systemImage: "stop.fill", role: .destructive) {
+                    model.stopStreaming()
+                }
+            } else {
+                Button("Choose Display & Start…", systemImage: "play.display") {
+                    model.startStreaming()
+                }
+                .disabled(!model.connectionState.isConnected)
+            }
+        }
+
+        Divider()
+
+        Button("Quit Frames to Fire TV") {
+            model.stop()
+            NSApplication.shared.terminate(nil)
+        }
+        .keyboardShortcut("q")
     }
 
-    private var receiverSidebar: some View {
-        VStack(alignment: .leading, spacing: 0) {
+    private func connect(to device: MacFireTVDevice) {
+        model.select(device)
+        if device.isRemembered {
+            model.pair()
+        } else {
+            showPairingWindow()
+        }
+    }
+
+    private func showPairingWindow() {
+        openWindow(id: MacPairingWindow.id)
+        NSApplication.shared.activate()
+    }
+}
+
+struct MacPairingView: View {
+    @Bindable var model: MacStreamingModel
+    @Environment(\.dismissWindow) private var dismissWindow
+    @FocusState private var focusedField: Field?
+
+    private enum Field {
+        case address
+        case code
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 5) {
-                Text("Receivers")
+                Label("Pair \(model.selectedReceiverName)", systemImage: "lock.shield")
                     .font(.title2.weight(.semibold))
-                Text("On this Wi-Fi network")
-                    .font(.caption)
+                Text("You will only need to do this once on this Mac.")
                     .foregroundStyle(.secondary)
             }
-            .padding(.horizontal, 18)
-            .padding(.top, 20)
-            .padding(.bottom, 14)
 
-            if model.devices.isEmpty {
-                HStack(spacing: 10) {
-                    ProgressView().controlSize(.small)
-                    Text("Searching…")
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.horizontal, 18)
-                .padding(.vertical, 12)
-            } else {
-                List(model.devices, selection: $model.selectedDeviceID) { device in
-                    Label(device.name, systemImage: "tv")
-                        .tag(device.id)
-                        .padding(.vertical, 4)
-                }
-                .listStyle(.sidebar)
-            }
-
-            Spacer(minLength: 12)
-            Divider()
-
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Manual address")
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(.secondary)
-                TextField("192.168.1.100", text: $model.manualAddress)
+            if model.needsManualAddress {
+                TextField("Fire TV IP address", text: $model.manualAddress)
                     .textFieldStyle(.roundedBorder)
                     .focused($focusedField, equals: .address)
                     .onSubmit { focusedField = .code }
-                Text("Used if Bonjour discovery is blocked.")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
             }
-            .padding(16)
+
+            TextField("Six-digit code", text: $model.pairingCode)
+                .font(.system(.title2, design: .rounded, weight: .semibold))
+                .monospacedDigit()
+                .multilineTextAlignment(.center)
+                .textFieldStyle(.roundedBorder)
+                .focused($focusedField, equals: .code)
+                .onChange(of: model.pairingCode) { _, value in
+                    model.pairingCode = String(value.filter(\.isNumber).prefix(6))
+                }
+                .onSubmit { pair() }
+
+            if case .failed(let message) = model.connectionState {
+                Label(message, systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack {
+                Button("Cancel", role: .cancel) {
+                    dismissWindow(id: MacPairingWindow.id)
+                }
+                Spacer()
+                Button("Pair & Connect", systemImage: "lock.shield") {
+                    pair()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!model.canPair || model.isBusy)
+            }
         }
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.42))
-    }
-
-    private var streamPanel: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
-                VStack(alignment: .leading, spacing: 7) {
-                    Text("Stream to Fire TV")
-                        .font(.largeTitle.weight(.semibold))
-                    Text("Your display and system audio stay encrypted on your local network.")
-                        .foregroundStyle(.secondary)
-                }
-
-                connectionStatus
-
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("Pairing code")
-                        .font(.headline)
-                    TextField("000000", text: $model.pairingCode)
-                        .font(.system(size: 30, weight: .semibold, design: .rounded))
-                        .monospacedDigit()
-                        .multilineTextAlignment(.center)
-                        .textFieldStyle(.plain)
-                        .padding(.vertical, 12)
-                        .padding(.horizontal, 14)
-                        .background(.quaternary.opacity(0.65), in: RoundedRectangle(cornerRadius: 10))
-                        .overlay {
-                            RoundedRectangle(cornerRadius: 10)
-                                .stroke(
-                                    focusedField == .code ? Color.accentColor : .clear,
-                                    lineWidth: 2
-                                )
-                        }
-                        .focused($focusedField, equals: .code)
-                        .onChange(of: model.pairingCode) { _, value in
-                            model.pairingCode = String(value.filter(\.isNumber).prefix(6))
-                        }
-                        .onSubmit { model.pair() }
-
-                    Button {
-                        focusedField = nil
-                        model.pair()
-                    } label: {
-                        Label("Pair with Fire TV", systemImage: "lock.shield")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
-                    .tint(.blue)
-                    .disabled(!model.canPair || model.connectionState.isConnected)
-                }
-
-                Divider()
-
-                VStack(alignment: .leading, spacing: 13) {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Display & audio")
-                                .font(.headline)
-                            Text("60 fps · H.264 · automatic system audio")
-                                .font(.subheadline)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        Image(systemName: "speaker.wave.3.fill")
-                            .foregroundStyle(model.isStreaming ? .green : .secondary)
-                            .accessibilityLabel("System audio included")
-                    }
-
-                    Picker("Quality", selection: $model.selectedQuality) {
-                        ForEach(MacStreamQuality.allCases) { quality in
-                            Text(quality.label).tag(quality)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .disabled(model.isStreaming)
-                    .accessibilityLabel("Streaming quality")
-
-                    HStack {
-                        Text(model.selectedQuality.detail)
-                        Spacer()
-                        Text(model.selectedQuality.bandwidth)
-                            .monospacedDigit()
-                    }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-                    if model.isStreaming {
-                        Button(role: .destructive) {
-                            model.stopStreaming()
-                        } label: {
-                            Label("Stop Streaming", systemImage: "stop.fill")
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.large)
-                    } else {
-                        Button {
-                            model.startStreaming()
-                        } label: {
-                            Label("Choose Display & Start", systemImage: "play.display")
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.large)
-                        .tint(.blue)
-                        .disabled(!model.connectionState.isConnected)
-                    }
-
-                    Text("macOS will ask which display to share. Audio from Twitch and other apps is sent automatically; your microphone is not included.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+        .padding(22)
+        .frame(width: 380)
+        .task {
+            focusedField = model.needsManualAddress ? .address : .code
+        }
+        .onChange(of: model.connectionState) { _, state in
+            if state.isConnected {
+                dismissWindow(id: MacPairingWindow.id)
             }
-            .padding(32)
-            .frame(maxWidth: 660, alignment: .leading)
         }
     }
 
-    private var connectionStatus: some View {
-        HStack(spacing: 11) {
-            Image(systemName: model.statusSymbol)
-                .foregroundStyle(model.statusColor)
-                .symbolEffect(.pulse, isActive: model.isBusy)
-            Text(model.connectionState.message)
-                .font(.subheadline.weight(.medium))
-            Spacer()
-            if model.isStreaming {
-                Text("LIVE")
-                    .font(.caption2.bold())
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(.red, in: Capsule())
-            }
-        }
-        .padding(14)
-        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
-        .accessibilityElement(children: .combine)
+    private func pair() {
+        guard model.canPair else { return }
+        focusedField = nil
+        model.pair()
     }
 }
 
@@ -261,15 +211,39 @@ final class MacStreamingModel {
             guard let self else { return }
             self.transport.sendAudio(frame.buffer)
         }
+        transport.startDiscovery()
     }
 
     var canPair: Bool {
-        pairingCode.count == 6
+        selectedReceiverIsRemembered ||
+            (pairingCode.count == 6 && (!needsManualAddress || validManualHost != nil))
+    }
+
+    var selectedReceiverName: String {
+        selectedDevice?.name ?? "Fire TV"
+    }
+
+    var needsManualAddress: Bool { selectedDevice == nil }
+
+    var menuBarSymbol: String {
+        if isStreaming { return "dot.radiowaves.left.and.right" }
+        if connectionState.isConnected { return "display" }
+        return "display.trianglebadge.exclamationmark"
+    }
+
+    var statusMessage: String {
+        if case .searching = connectionState, let selectedDevice {
+            return selectedDevice.isRemembered
+                ? "\(selectedDevice.name) is ready to connect"
+                : "\(selectedDevice.name) found — enter its code once"
+        }
+        return connectionState.message
     }
 
     var isBusy: Bool {
         switch connectionState {
-        case .searching, .waitingForReceiver, .connecting, .authenticating: true
+        case .searching: devices.isEmpty
+        case .waitingForReceiver, .connecting, .authenticating: true
         default: false
         }
     }
@@ -280,6 +254,7 @@ final class MacStreamingModel {
         case .connected: "checkmark.shield.fill"
         case .failed: "exclamationmark.triangle.fill"
         case .disconnected: "bolt.horizontal.circle"
+        case .searching where !devices.isEmpty: "checkmark.circle.fill"
         default: "antenna.radiowaves.left.and.right"
         }
     }
@@ -289,12 +264,17 @@ final class MacStreamingModel {
         return switch connectionState {
         case .connected: .green
         case .failed: .orange
+        case .searching where !devices.isEmpty: .green
         default: .accentColor
         }
     }
 
     private var selectedDevice: MacFireTVDevice? {
         devices.first { $0.id == selectedDeviceID }
+    }
+
+    var selectedReceiverIsRemembered: Bool {
+        selectedDevice?.isRemembered == true
     }
 
     private var validManualHost: String? {
@@ -306,9 +286,34 @@ final class MacStreamingModel {
         transport.startDiscovery()
     }
 
+    func deviceSymbol(for device: MacFireTVDevice) -> String {
+        device.name.localizedCaseInsensitiveContains("iphone") ||
+            device.name.localizedCaseInsensitiveContains("ipad")
+            ? "iphone"
+            : "tv"
+    }
+
+    func select(_ device: MacFireTVDevice) {
+        selectedDeviceID = device.id
+        manualAddress = ""
+        if !device.isRemembered {
+            pairingCode = ""
+        }
+    }
+
+    func prepareManualPairing() {
+        selectedDeviceID = nil
+        manualAddress = ""
+        pairingCode = ""
+    }
+
     func pair() {
-        guard pairingCode.count == 6 else { return }
-        transport.waitForFireTV(code: pairingCode)
+        guard canPair else { return }
+        if let selectedDevice {
+            transport.connect(to: selectedDevice, code: pairingCode)
+        } else if let validManualHost {
+            transport.connectDirect(host: validManualHost, code: pairingCode)
+        }
     }
 
     func startStreaming() {
@@ -400,13 +405,14 @@ private extension MacFireTVDevice {
             endpoint: .hostPort(
                 host: NWEndpoint.Host(host),
                 port: NWEndpoint.Port(rawValue: 49_218)!
-            )
+            ),
+            receiverID: nil
         )
     }
 }
 
-#Preview {
-    MacContentView()
+#Preview("Pair Receiver") {
+    MacPairingView(model: MacStreamingModel())
 }
 
 #endif

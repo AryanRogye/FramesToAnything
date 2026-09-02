@@ -42,7 +42,7 @@ The main SwiftUI app:
 
 - Discovers Fire TV receivers through Bonjour using `_iosfiretv._tcp`.
 - Supports a direct-IP fallback when multicast discovery is unavailable.
-- Authenticates using the six-digit code displayed on the receiver.
+- Authenticates using the displayed six-digit code once, then remembers that Fire TV.
 - Stores the chosen destination in the shared app-group container for the broadcast extension.
 - Opens the system ReplayKit broadcast picker.
 
@@ -73,8 +73,9 @@ The Mac version:
 - Captures a user-selected display with SnapCore and ScreenCaptureKit.
 - Captures stereo system audio while excluding the microphone and the sender app's own audio.
 - Encodes H.264 in real time with B-frames disabled.
+- Discovers named Fire TV and iPhone/iPad receivers and targets only the selected device.
 - Advertises `_framesmac._tcp` so the Fire TV or iOS receiver can connect to it.
-- Accepts the receiver's six-digit code and completes mutual authentication.
+- Uses the receiver's six-digit code once, then remembers that receiver securely for later sessions.
 - Offers HD, Full HD, QHD, and UHD bitrate presets.
 
 Screen Recording permission is required on first launch.
@@ -88,7 +89,9 @@ This standalone iOS/iPadOS app uses bundle ID `com.aryanrogye.iOSFramesReceiver`
 The iPhone/iPad version:
 
 - Displays a rotating six-digit pairing code.
+- Advertises its device name and a stable, non-secret receiver ID through Bonjour.
 - Discovers `_framesmac._tcp` Mac senders using Bonjour.
+- Remembers approved Macs so routine connections no longer require the code.
 - Connects to the Mac and performs the same authenticated handshake as the Fire TV receiver.
 - Parses and decrypts framed AES-GCM media records.
 - Converts Annex-B H.264 access units for `AVSampleBufferDisplayLayer` hardware playback.
@@ -112,6 +115,8 @@ The Kotlin Fire TV / Android TV receiver:
 - Drops stale queued media to keep live playback responsive.
 
 The Android project uses Gradle, Kotlin, and Java 17.
+
+The Fire TV receiver advertises the name configured on the device (falling back to its manufacturer and model) and remembers approved Macs in app-private storage.
 
 ## Requirements
 
@@ -141,7 +146,7 @@ A 5 GHz or wired receiver connection is recommended for 1080p/60 playback.
 3. Open `iOSFramesToFireTV.xcodeproj` in Xcode.
 4. Select the `iOSFramesToFireTV` scheme and run it on a physical iPhone or iPad.
 5. Select the discovered TV, or enter its IP address manually.
-6. Enter the TV's six-digit code and pair.
+6. The first time, enter the TV's six-digit code and pair. Later sessions can use the remembered TV without a code.
 7. Tap the broadcast button, choose `FireTVBroadcast`, and start broadcasting.
 
 ReplayKit may intentionally produce black video for DRM-protected content. Some protected `AVPlayer` content cannot be captured.
@@ -151,8 +156,9 @@ ReplayKit may intentionally produce black video for DRM-protected content. Some 
 1. Build and launch `fire-tv/` on the television.
 2. Open `macOSFramesToFireTV/macOSFramesToFireTV.xcodeproj` in Xcode.
 3. Run the `macOSFramesToFireTV` scheme with **My Mac** selected.
-4. Enter the code displayed by the Fire TV and start pairing.
-5. After authentication, choose a display and begin streaming.
+4. Select the Fire TV. The first time, enter its displayed code and start pairing.
+5. On later sessions, select the remembered Fire TV and connect without a code.
+6. After authentication, choose a display and begin streaming.
 
 ### Mac → iPhone/iPad
 
@@ -160,11 +166,12 @@ ReplayKit may intentionally produce black video for DRM-protected content. Some 
 2. Run the `iOSFramesReceiver` scheme on the physical iPhone or iPad.
 3. Leave the iOS receiver open and note its six-digit code.
 4. Run the same scheme on the Mac.
-5. Enter the iOS receiver's code in the Mac app and start pairing.
-6. Choose a display on the Mac.
-7. Tap the expand button in the iOS preview to enter full-screen playback.
+5. Select the iOS receiver. The first time, enter its code in the Mac app and start pairing.
+6. On later sessions, select the remembered receiver and connect without a code.
+7. Choose a display on the Mac.
+8. Tap the expand button in the iOS preview to enter full-screen playback.
 
-Only one receiver should be open while pairing. Fire TV, another iPhone/iPad, or a running Simulator receiver can discover the same Mac and race to claim its single incoming connection.
+The Mac includes the selected receiver's stable ID in its short-lived Bonjour advertisement, so other open receivers ignore that stream request.
 
 ## Media pipeline
 
@@ -195,6 +202,8 @@ Only one receiver should be open while pairing. Fire TV, another iPhone/iPad, or
 
 Fire TV also uses TCP port `49218` for the direct-IP fallback. The Mac sender uses a Bonjour-advertised listener endpoint.
 
+Receiver advertisements include a friendly service name plus a stable random receiver ID in the Bonjour TXT record. A Mac sender advertisement includes that ID as its target, preventing a different open receiver from racing to connect.
+
 ## Pairing protocol
 
 The receiver generates the code and initiates the authenticated handshake after a TCP connection is established:
@@ -207,6 +216,8 @@ The receiver generates the code and initiates the authenticated handshake after 
 6. Both sides use the derived key for AES-256-GCM media records.
 
 Incorrect or completed sessions rotate the receiver's pairing code.
+
+After a successful code-based pairing, both peers derive the same 256-bit remembered-device secret from the authenticated session without transmitting that secret. The Mac and iOS receiver store it in Keychain; the ReplayKit sender and its host app share it through their private app-group container; Fire TV stores it in app-private preferences with Android backup disabled. Future connections derive fresh session keys from the remembered secret, new random salt, and new challenges. If either side loses its saved state, the app falls back to one-time code pairing.
 
 ## Wire format
 
@@ -255,7 +266,6 @@ The maximum framed media record is 8 MiB. JSON handshake records are limited to 
 ## Current limitations
 
 - A Mac sender accepts one receiver connection at a time.
-- Multiple open receivers can race to connect because receiver targeting has not yet been implemented.
 - iOS receiver playback is foreground-oriented.
 - DRM-protected video may be black or unavailable to ReplayKit and ScreenCaptureKit.
 - Latency and sustainable resolution depend heavily on the sender, receiver hardware, and Wi-Fi conditions.

@@ -118,7 +118,7 @@ struct iOSReceiverView: View {
                     .accessibilityLabel("Pairing code \(model.pairingCode)")
             }
 
-            Text("Open Mac Frames to Fire TV on your Mac, enter this code, then choose a display to share.")
+            Text("Select this iPhone or iPad on your Mac. Enter the code the first time; this receiver will be remembered.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)

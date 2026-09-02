@@ -3,6 +3,8 @@ package com.aryanrogye.iosfiretv
 import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
+import android.os.Build
+import android.provider.Settings
 import android.util.Base64
 import android.util.Log
 import org.json.JSONObject
@@ -11,6 +13,7 @@ import java.io.BufferedOutputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.net.InetSocketAddress
+import java.net.ServerSocket
 import java.net.Socket
 import java.nio.charset.StandardCharsets
 import java.nio.ByteBuffer
@@ -20,6 +23,7 @@ import java.security.SecureRandom
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.UUID
 import javax.crypto.Cipher
 import javax.crypto.Mac
 import javax.crypto.SecretKeyFactory
@@ -48,24 +52,36 @@ class PairingServer(
         fun onMediaEnded()
     }
 
-    private val nsdManager = context.getSystemService(Context.NSD_SERVICE) as NsdManager
+    private val appContext = context.applicationContext
+    private val nsdManager = appContext.getSystemService(Context.NSD_SERVICE) as NsdManager
+    private val preferences = appContext.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
     private val executor: ExecutorService = Executors.newCachedThreadPool()
     private val running = AtomicBoolean(false)
     private val resetRequested = AtomicBoolean(false)
+    private val sessionActive = AtomicBoolean(false)
     private val random = SecureRandom()
     @Volatile
     private var clientSocket: Socket? = null
+    @Volatile
+    private var serverSocket: ServerSocket? = null
     private var discoveryListener: NsdManager.DiscoveryListener? = null
+    private var registrationListener: NsdManager.RegistrationListener? = null
     @Volatile
     private var resolvedMac: InetSocketAddress? = null
     private val connecting = AtomicBoolean(false)
     @Volatile
     private lateinit var pairingCode: String
+    private val receiverID: String = preferences.getString(RECEIVER_ID_KEY, null)
+        ?: UUID.randomUUID().toString().lowercase().also {
+            preferences.edit().putString(RECEIVER_ID_KEY, it).apply()
+        }
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
 
         rotatePairingCode()
+        acceptDirectSenders()
+        advertiseReceiver()
 
         listener.onStatus("Looking for a Mac…", false)
         discoverMacSender()
@@ -86,8 +102,11 @@ class PairingServer(
     fun stop() {
         running.set(false)
         runCatching { clientSocket?.close() }
+        runCatching { serverSocket?.close() }
         discoveryListener?.let { runCatching { nsdManager.stopServiceDiscovery(it) } }
         discoveryListener = null
+        registrationListener?.let { runCatching { nsdManager.unregisterService(it) } }
+        registrationListener = null
         executor.shutdownNow()
     }
 
@@ -106,6 +125,7 @@ class PairingServer(
                 JSONObject()
                     .put("type", "hello")
                     .put("version", 1)
+                    .put("receiverID", receiverID)
                     .put("salt", encode(salt))
                     .put("challenge", encode(serverChallenge)),
             )
@@ -113,13 +133,34 @@ class PairingServer(
             val auth = readJson(input)
             require(auth.optString("type") == "auth") { "Expected authentication" }
             val deviceName = auth.optString("name").trim().takeIf { it.isNotEmpty() }
+            val senderID = auth.optString("senderID").trim().takeIf { it.isNotEmpty() }
+            val mode = auth.optString("mode", "code")
             Log.i(TAG, "authentication request from ${deviceName ?: "unknown device"}")
             listener.onPairingRequest(deviceName)
             val clientChallenge = decode(auth.getString("challenge"))
             val suppliedProof = decode(auth.getString("proof"))
             require(clientChallenge.size == 32) { "Invalid challenge" }
 
-            val key = deriveKey(pairingCode, salt)
+            val key = when (mode) {
+                "remembered" -> senderID
+                    ?.let(::loadTrustedSender)
+                    ?.let { deriveRememberedSessionKey(it, salt, serverChallenge, clientChallenge) }
+                "code" -> deriveKey(pairingCode, salt)
+                else -> null
+            }
+            if (key == null) {
+                writeJson(
+                    output,
+                    JSONObject()
+                        .put("type", "auth_failed")
+                        .put("reason", if (mode == "remembered") "forgotten" else "code"),
+                )
+                listener.onStatus(
+                    if (mode == "remembered") "This Mac needs to pair again" else "Incorrect pairing code",
+                    false,
+                )
+                return
+            }
             val expectedProof = hmac(
                 key,
                 "client".toByteArray(StandardCharsets.UTF_8),
@@ -128,9 +169,24 @@ class PairingServer(
             )
             if (!MessageDigest.isEqual(suppliedProof, expectedProof)) {
                 Log.w(TAG, "authentication rejected for ${deviceName ?: "unknown device"}")
-                writeJson(output, JSONObject().put("type", "auth_failed"))
-                listener.onStatus("Incorrect pairing code", false)
+                writeJson(
+                    output,
+                    JSONObject()
+                        .put("type", "auth_failed")
+                        .put("reason", if (mode == "remembered") "forgotten" else "code"),
+                )
+                listener.onStatus(
+                    if (mode == "remembered") "This Mac needs to pair again" else "Incorrect pairing code",
+                    false,
+                )
                 return
+            }
+
+            if (mode == "code" && senderID != null) {
+                saveTrustedSender(
+                    senderID,
+                    deriveTrustSecret(key, serverChallenge, clientChallenge),
+                )
             }
 
             val serverProof = hmac(
@@ -159,6 +215,45 @@ class PairingServer(
         } finally {
             listener.onMediaEnded()
             runCatching { socket.close() }
+        }
+    }
+
+    private fun acceptDirectSenders() {
+        executor.execute {
+            try {
+                val server = ServerSocket().apply {
+                    reuseAddress = true
+                    bind(InetSocketAddress(STREAM_PORT))
+                }
+                serverSocket = server
+                while (running.get()) {
+                    val socket = server.accept()
+                    if (!sessionActive.compareAndSet(false, true)) {
+                        runCatching { socket.close() }
+                        continue
+                    }
+                    executor.execute {
+                        clientSocket = socket
+                        try {
+                            handleClient(socket)
+                        } finally {
+                            if (clientSocket === socket) clientSocket = null
+                            sessionActive.set(false)
+                            if (running.get() && !resetRequested.getAndSet(false)) {
+                                rotatePairingCode()
+                                listener.onStatus("Looking for a sender…", false)
+                            }
+                        }
+                    }
+                }
+            } catch (error: Exception) {
+                if (running.get()) {
+                    Log.e(TAG, "direct sender listener failed", error)
+                    listener.onStatus("Could not start receiver: ${error.message ?: "unknown"}", false)
+                }
+            } finally {
+                serverSocket = null
+            }
         }
     }
 
@@ -233,6 +328,10 @@ class PairingServer(
                         }
 
                         override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
+                            val target = serviceInfo.attributes["target"]
+                                ?.toString(StandardCharsets.UTF_8)
+                                ?.takeIf { it.isNotEmpty() }
+                            if (target != null && target != receiverID) return
                             val endpoint = InetSocketAddress(serviceInfo.host, serviceInfo.port)
                             resolvedMac = endpoint
                             connectToMac(endpoint)
@@ -257,10 +356,44 @@ class PairingServer(
         nsdManager.discoverServices(MAC_SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, discovery)
     }
 
+    private fun advertiseReceiver() {
+        val deviceName = Settings.Global.getString(
+            appContext.contentResolver,
+            "device_name",
+        )?.trim()?.takeIf { it.isNotEmpty() }
+            ?: listOf(Build.MANUFACTURER, Build.MODEL)
+                .filter { it.isNotBlank() }
+                .joinToString(" ")
+                .ifBlank { "Fire TV" }
+
+        val service = NsdServiceInfo().apply {
+            serviceName = deviceName
+            serviceType = RECEIVER_SERVICE_TYPE
+            port = STREAM_PORT
+            setAttribute("id", receiverID)
+            setAttribute("kind", "firetv")
+        }
+        val registration = object : NsdManager.RegistrationListener {
+            override fun onServiceRegistered(serviceInfo: NsdServiceInfo) {
+                Log.i(TAG, "advertising receiver as ${serviceInfo.serviceName}")
+            }
+
+            override fun onRegistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
+                Log.w(TAG, "receiver advertisement failed: $errorCode")
+            }
+
+            override fun onServiceUnregistered(serviceInfo: NsdServiceInfo) = Unit
+            override fun onUnregistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) = Unit
+        }
+        registrationListener = registration
+        nsdManager.registerService(service, NsdManager.PROTOCOL_DNS_SD, registration)
+    }
+
     private fun connectToMac(endpoint: InetSocketAddress) {
         if (!running.get() || !connecting.compareAndSet(false, true)) return
         executor.execute {
             var connected = false
+            var claimedSession = false
             try {
                 listener.onStatus("Connecting to ${endpoint.hostString}…", false)
                 val socket = Socket().apply {
@@ -270,6 +403,11 @@ class PairingServer(
                     connect(endpoint, CONNECT_TIMEOUT_MS)
                 }
                 connected = true
+                if (!sessionActive.compareAndSet(false, true)) {
+                    runCatching { socket.close() }
+                    return@execute
+                }
+                claimedSession = true
                 clientSocket = socket
                 Log.i(TAG, "connected to Mac at $endpoint")
                 handleClient(socket)
@@ -280,6 +418,7 @@ class PairingServer(
                 }
             } finally {
                 clientSocket = null
+                if (claimedSession) sessionActive.set(false)
                 connecting.set(false)
                 if (connected && running.get()) {
                     if (!resetRequested.getAndSet(false)) rotatePairingCode()
@@ -335,6 +474,39 @@ class PairingServer(
         }
     }
 
+    private fun deriveRememberedSessionKey(
+        secret: ByteArray,
+        salt: ByteArray,
+        serverChallenge: ByteArray,
+        clientChallenge: ByteArray,
+    ): ByteArray = hmac(
+        secret,
+        "session".toByteArray(StandardCharsets.UTF_8),
+        salt,
+        serverChallenge,
+        clientChallenge,
+    )
+
+    private fun deriveTrustSecret(
+        key: ByteArray,
+        serverChallenge: ByteArray,
+        clientChallenge: ByteArray,
+    ): ByteArray = hmac(
+        key,
+        "remember-receiver".toByteArray(StandardCharsets.UTF_8),
+        serverChallenge,
+        clientChallenge,
+    )
+
+    private fun loadTrustedSender(senderID: String): ByteArray? =
+        preferences.getString("$TRUSTED_SENDER_PREFIX$senderID", null)?.let(::decode)
+
+    private fun saveTrustedSender(senderID: String, secret: ByteArray) {
+        preferences.edit()
+            .putString("$TRUSTED_SENDER_PREFIX$senderID", encode(secret))
+            .apply()
+    }
+
     private fun hmac(key: ByteArray, vararg parts: ByteArray): ByteArray =
         Mac.getInstance("HmacSHA256").run {
             init(SecretKeySpec(key, "HmacSHA256"))
@@ -354,6 +526,10 @@ class PairingServer(
     private companion object {
         const val TAG = "FireTVProtocol"
         const val MAC_SERVICE_TYPE = "_framesmac._tcp."
+        const val RECEIVER_SERVICE_TYPE = "_iosfiretv._tcp."
+        const val PREFERENCES_NAME = "remembered_devices"
+        const val RECEIVER_ID_KEY = "receiver_id"
+        const val TRUSTED_SENDER_PREFIX = "trusted_sender."
         const val PACKET_JSON = 0
         const val STREAM_PORT = 49_218
         const val CONNECT_TIMEOUT_MS = 5_000

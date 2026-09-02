@@ -9,11 +9,20 @@ import SwiftUI
 
 @main
 struct macOSFramesToFireTVApp: App {
+    @State private var model = MacStreamingModel()
+
     var body: some Scene {
-        WindowGroup {
-            MacContentView()
+        MenuBarExtra {
+            MacMenuBarContent(model: model)
+        } label: {
+            Label("Frames to Fire TV", systemImage: model.menuBarSymbol)
         }
-        .defaultSize(width: 820, height: 590)
-        .windowResizability(.contentMinSize)
+
+        Window("Pair Receiver", id: MacPairingWindow.id) {
+            MacPairingView(model: model)
+        }
+        .defaultLaunchBehavior(.suppressed)
+        .defaultSize(width: 380, height: 280)
+        .windowResizability(.contentSize)
     }
 }

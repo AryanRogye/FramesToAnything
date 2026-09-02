@@ -12,6 +12,7 @@ import CryptoKit
 import Foundation
 import Network
 import Security
+import UIKit
 
 /// Discovers the Mac sender, authenticates it with the displayed pairing code,
 /// and turns the encrypted TCP stream into decoded media packet callbacks.
@@ -44,6 +45,7 @@ nonisolated final class PairingService: @unchecked Sendable {
     )
 
     private var browser: NWBrowser?
+    private var advertisementListener: NWListener?
     private var connection: NWConnection?
     private var resolvedMac: NWEndpoint?
     private var receiveBuffer = Data()
@@ -92,6 +94,7 @@ nonisolated final class PairingService: @unchecked Sendable {
             guard let self, !running else { return }
             running = true
             rotatePairingCode()
+            advertiseReceiver()
             reportStatus("Looking for a Mac…", streaming: false)
             discoverMacSender()
         }
@@ -105,6 +108,8 @@ nonisolated final class PairingService: @unchecked Sendable {
             connectTimeout = nil
             browser?.cancel()
             browser = nil
+            advertisementListener?.cancel()
+            advertisementListener = nil
             resolvedMac = nil
             if let connection {
                 finishConnection(connection, reconnect: false, reportEnded: authenticated)
@@ -148,7 +153,13 @@ nonisolated final class PairingService: @unchecked Sendable {
 
         browser.browseResultsChangedHandler = { [weak self] results, _ in
             guard let self, running else { return }
-            guard let endpoint = results
+            let matchingResults = results.filter { result in
+                guard let target = Self.txtValue("target", from: result) else {
+                    return true
+                }
+                return target == Self.receiverID
+            }
+            guard let endpoint = matchingResults
                 .map(\.endpoint)
                 .sorted(by: { String(describing: $0) < String(describing: $1) })
                 .first else {
@@ -160,6 +171,26 @@ nonisolated final class PairingService: @unchecked Sendable {
             connect(to: endpoint)
         }
         browser.start(queue: queue)
+    }
+
+    private func advertiseReceiver() {
+        advertisementListener?.cancel()
+        do {
+            let listener = try NWListener(using: .tcp)
+            listener.service = .init(
+                name: UIDevice.current.name,
+                type: "_iosfiretv._tcp",
+                txtRecord: NWTXTRecord([
+                    "id": Self.receiverID,
+                    "kind": "ios",
+                ])
+            )
+            listener.newConnectionHandler = { connection in connection.cancel() }
+            advertisementListener = listener
+            listener.start(queue: queue)
+        } catch {
+            reportStatus("Receiver discovery unavailable: \(error.localizedDescription)", streaming: false)
+        }
     }
 
     private func connect(to endpoint: NWEndpoint) {
@@ -221,6 +252,7 @@ nonisolated final class PairingService: @unchecked Sendable {
             [
                 "type": "hello",
                 "version": 1,
+                "receiverID": Self.receiverID,
                 "salt": salt.base64EncodedString(),
                 "challenge": challenge.base64EncodedString(),
             ],
@@ -292,6 +324,8 @@ nonisolated final class PairingService: @unchecked Sendable {
             throw PairingError.expectedAuthentication
         }
         let deviceName = (json["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let senderID = (json["senderID"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let mode = json["mode"] as? String ?? "code"
         reportPairingRequest(deviceName?.isEmpty == false ? deviceName : nil)
 
         guard let challengeValue = json["challenge"] as? String,
@@ -300,11 +334,27 @@ nonisolated final class PairingService: @unchecked Sendable {
               let suppliedProof = Data(base64Encoded: proofValue),
               clientChallenge.count == 32,
               let salt,
-              let serverChallenge,
-              let keyData = Self.deriveKey(code: pairingCode, salt: salt) else {
+              let serverChallenge else {
             throw PairingError.invalidAuthentication
         }
 
+        let keyData: Data?
+        if mode == "remembered", let senderID, let secret = TrustedSenderStore.load(senderID) {
+            keyData = Self.deriveRememberedSessionKey(
+                secret: secret,
+                salt: salt,
+                serverChallenge: serverChallenge,
+                clientChallenge: clientChallenge
+            )
+        } else if mode == "code" {
+            keyData = Self.deriveKey(code: pairingCode, salt: salt)
+        } else {
+            keyData = nil
+        }
+        guard let keyData else {
+            sendAuthenticationFailure(on: connection, remembered: mode == "remembered")
+            return
+        }
         let key = SymmetricKey(data: keyData)
         let expectedProof = Self.authenticationCode(
             key: key,
@@ -313,12 +363,17 @@ nonisolated final class PairingService: @unchecked Sendable {
             clientChallenge: clientChallenge
         )
         guard Self.constantTimeEqual(suppliedProof, expectedProof) else {
-            sendJSON(["type": "auth_failed"], on: connection) { [weak self, weak connection] _ in
-                guard let self, let connection, connection === self.connection else { return }
-                reportStatus("Incorrect pairing code", streaming: false)
-                finishConnection(connection, reconnect: true, reportEnded: false)
-            }
+            sendAuthenticationFailure(on: connection, remembered: mode == "remembered")
             return
+        }
+
+        if mode == "code", let senderID, !senderID.isEmpty {
+            let trustSecret = Self.deriveTrustSecret(
+                key: key,
+                serverChallenge: serverChallenge,
+                clientChallenge: clientChallenge
+            )
+            TrustedSenderStore.save(trustSecret, for: senderID)
         }
 
         let serverProof = Self.authenticationCode(
@@ -341,6 +396,20 @@ nonisolated final class PairingService: @unchecked Sendable {
                 return
             }
             reportStatus("Streaming display and audio", streaming: true)
+        }
+    }
+
+    private func sendAuthenticationFailure(on connection: NWConnection, remembered: Bool) {
+        sendJSON(
+            ["type": "auth_failed", "reason": remembered ? "forgotten" : "code"],
+            on: connection
+        ) { [weak self, weak connection] _ in
+            guard let self, let connection, connection === self.connection else { return }
+            reportStatus(
+                remembered ? "This Mac needs to pair again" : "Incorrect pairing code",
+                streaming: false
+            )
+            finishConnection(connection, reconnect: true, reportEnded: false)
         }
     }
 
@@ -534,6 +603,48 @@ nonisolated final class PairingService: @unchecked Sendable {
         return status == kCCSuccess ? derived : nil
     }
 
+    private static func deriveRememberedSessionKey(
+        secret: Data,
+        salt: Data,
+        serverChallenge: Data,
+        clientChallenge: Data
+    ) -> Data {
+        var message = Data("session".utf8)
+        message.append(salt)
+        message.append(serverChallenge)
+        message.append(clientChallenge)
+        return Data(HMAC<SHA256>.authenticationCode(
+            for: message,
+            using: SymmetricKey(data: secret)
+        ))
+    }
+
+    private static func deriveTrustSecret(
+        key: SymmetricKey,
+        serverChallenge: Data,
+        clientChallenge: Data
+    ) -> Data {
+        var message = Data("remember-receiver".utf8)
+        message.append(serverChallenge)
+        message.append(clientChallenge)
+        return Data(HMAC<SHA256>.authenticationCode(for: message, using: key))
+    }
+
+    private static func txtValue(_ key: String, from result: NWBrowser.Result) -> String? {
+        guard case .bonjour(let record) = result.metadata,
+              case .string(let value) = record.getEntry(for: key),
+              !value.isEmpty else { return nil }
+        return value
+    }
+
+    private static let receiverID: String = {
+        let key = "discovery.receiverID"
+        if let value = UserDefaults.standard.string(forKey: key) { return value }
+        let value = UUID().uuidString.lowercased()
+        UserDefaults.standard.set(value, forKey: key)
+        return value
+    }()
+
     private static func authenticationCode(
         key: SymmetricKey,
         label: String,
@@ -634,6 +745,39 @@ nonisolated final class PairingService: @unchecked Sendable {
     private static let reconnectDelayMilliseconds = 1_500
     private static let maximumJSONPacketBytes: UInt32 = 64 * 1024
     private static let maximumFramePacketBytes: UInt32 = 8 * 1024 * 1024
+}
+
+private enum TrustedSenderStore {
+    private static let service = "com.aryanrogye.iOSFramesReceiver.remembered-senders"
+
+    static func load(_ senderID: String) -> Data? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: senderID,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess else {
+            return nil
+        }
+        return result as? Data
+    }
+
+    static func save(_ secret: Data, for senderID: String) {
+        let lookup: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: senderID,
+        ]
+        let attributes = [kSecValueData as String: secret]
+        if SecItemUpdate(lookup as CFDictionary, attributes as CFDictionary) == errSecItemNotFound {
+            var item = lookup
+            item[kSecValueData as String] = secret
+            SecItemAdd(item as CFDictionary, nil)
+        }
+    }
 }
 
 #endif

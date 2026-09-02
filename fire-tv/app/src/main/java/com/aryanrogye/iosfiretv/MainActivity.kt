@@ -168,7 +168,7 @@ class MainActivity : Activity(), PairingServer.Listener {
             setPadding(0, 22, 0, 22)
         }
         instructionsView = label(22f, Color.rgb(151, 165, 184)).apply {
-            text = "Open Frames to Fire TV on your iPhone or Mac,\nselect this TV, and enter the code."
+            text = "Select this receiver on your iPhone or Mac.\nEnter the code the first time; this device will be remembered."
             gravity = Gravity.CENTER
         }
 

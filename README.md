@@ -178,6 +178,27 @@ ReplayKit may intentionally produce black video for DRM-protected content. Some 
 
 The Mac includes the selected receiver's stable ID in its short-lived Bonjour advertisement, so other open receivers ignore that stream request.
 
+## Protecting A/V synchronization
+
+A/V synchronization is a merge-blocking correctness contract for the Fire TV
+receiver. Video must use the measured audio playback position as its presentation
+clock; queue arrival, decode completion, and `AudioTrack.play()` call time must
+never become independent video clocks.
+
+Run the same safety gate used by CI before merging receiver changes:
+
+```sh
+cd fire-tv
+./gradlew :app:verifyPlaybackSafety
+```
+
+The gate runs deterministic clock regression tests and builds both debug and
+release APKs. The tests cover delayed HDMI startup, invalid Fire OS timestamps,
+clock discontinuities, stalled audio, jitter, long playback, counter wrapping,
+and reset behavior. The GitHub workflow is named `Fire TV playback safety`; make
+its `A/V sync contract and APK builds` check required in the `main` branch
+protection rules so a failing or skipped result cannot be merged.
+
 ## Media pipeline
 
 ### Cinema playback

@@ -1,0 +1,48 @@
+name: Fire TV playback safety
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "fire-tv/**"
+      - ".github/workflows/fire-tv-playback.yml"
+  push:
+    branches: [main]
+    paths:
+      - "fire-tv/**"
+      - ".github/workflows/fire-tv-playback.yml"
+
+# A newer push makes the older result irrelevant. Cancelling it also prevents a
+# stale successful run from being mistaken for validation of the latest commit.
+concurrency:
+  group: fire-tv-playback-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  av-sync-contract:
+    name: A/V sync contract and APK builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out the exact commit under review
+        uses: actions/checkout@v6
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Configure Gradle cache
+        uses: gradle/actions/setup-gradle@v6
+
+      # testDebugUnitTest contains the deterministic playback-clock contract.
+      # Both APK builds remain here because a test-only success is insufficient
+      # if production Android wiring no longer compiles in either build type.
+      - name: Enforce playback contract and build APKs
+        working-directory: fire-tv
+        run: ./gradlew :app:verifyPlaybackSafety --stacktrace

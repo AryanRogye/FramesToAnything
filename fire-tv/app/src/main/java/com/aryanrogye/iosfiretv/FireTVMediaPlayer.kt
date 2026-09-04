@@ -3,6 +3,7 @@ package com.aryanrogye.iosfiretv
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
+import android.media.AudioTimestamp
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.os.Build
@@ -42,6 +43,7 @@ class FireTVMediaPlayer(
     @Volatile private var lastPresentedTimestampMilliseconds = 0L
     @Volatile private var lastReceivedVideoTimestampMilliseconds = 0L
     @Volatile private var firstPlayableVideoTimestampMilliseconds = 0L
+    private var scheduledVideoFrames = 0L
 
     private val outputInfo = MediaCodec.BufferInfo()
 
@@ -207,6 +209,7 @@ class FireTVMediaPlayer(
         videoConfiguration = null
         waitingForKeyFrame = true
         firstPlayableVideoTimestampMilliseconds = 0L
+        scheduledVideoFrames = 0
         clock.reset()
     }
 
@@ -318,6 +321,16 @@ class FireTVMediaPlayer(
                     } else {
                         codec.releaseOutputBuffer(outputIndex, renderTime)
                         lastPresentedTimestampMilliseconds = timestampMilliseconds
+                        scheduledVideoFrames += 1
+                        if (scheduledVideoFrames == 1L || scheduledVideoFrames % 120L == 0L) {
+                            val audioNow = clock.currentMediaTimestampMilliseconds()
+                            Log.d(
+                                TAG,
+                                "A/V schedule frame=$scheduledVideoFrames " +
+                                    "videoMs=$timestampMilliseconds audioMs=$audioNow " +
+                                    "leadMs=${(renderTime - System.nanoTime()) / 1_000_000L}",
+                            )
+                        }
                     }
                 }
                 outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED ->
@@ -451,6 +464,7 @@ class FireTVMediaPlayer(
             clock.startAudio(
                 track,
                 firstAudioTimestampMilliseconds ?: timestampMilliseconds,
+                audioSampleRate,
             )
             Log.i(
                 TAG,
@@ -541,44 +555,214 @@ class FireTVMediaPlayer(
         private val lock = Any()
         private var track: AudioTrack? = null
         private var firstAudioTimestampMilliseconds = 0L
-        private var fallbackRealtimeNanoseconds = 0L
+        private var sampleRate = 0
+        private var playbackRequestedNanoseconds = 0L
+        private var lastTimestampPollNanoseconds = 0L
+        private var maximumObservedFramePosition = 0L
+        private var timestampCandidate: AudioAnchor? = null
+        private var timestampAnchor: AudioAnchor? = null
+        private var playbackHeadAnchor: AudioAnchor? = null
+        private var loggedTimestampAnchor = false
+        private var loggedPlaybackHeadFallback = false
 
-        fun startAudio(track: AudioTrack, timestampMilliseconds: Long) {
+        /**
+         * Starts the one playback timeline used by both audio and video.
+         *
+         * Calling [AudioTrack.play] only asks Android to begin playback. It does
+         * not mean that frame zero is audible at that instant: AudioFlinger, the
+         * HDMI route, and the television can still have buffered work. Anchoring
+         * video to the play() call therefore makes video appear before its audio.
+         * We deliberately wait for a measured audio-device position instead.
+         */
+        fun startAudio(track: AudioTrack, timestampMilliseconds: Long, sampleRate: Int) {
             synchronized(lock) {
                 this.track = track
                 firstAudioTimestampMilliseconds = timestampMilliseconds
-                fallbackRealtimeNanoseconds = System.nanoTime()
+                this.sampleRate = sampleRate
+                playbackRequestedNanoseconds = System.nanoTime()
+                lastTimestampPollNanoseconds = 0
+                maximumObservedFramePosition = 0
+                timestampCandidate = null
+                timestampAnchor = null
+                playbackHeadAnchor = null
+                loggedTimestampAnchor = false
+                loggedPlaybackHeadFallback = false
             }
         }
 
         fun renderTimeNanoseconds(mediaTimestampMilliseconds: Long): Long? = synchronized(lock) {
-            if (track == null || fallbackRealtimeNanoseconds == 0L) return null
-            // Fire OS can report AudioTimestamp.nanoTime several seconds ahead
-            // of System.nanoTime() even while playback is healthy. SurfaceFlinger
-            // rejects those implausible presentation times, causing visible A/V
-            // separation. AudioTrack starts at this monotonic anchor and runs at
-            // the configured sample rate, so keep the shared media timeline on
-            // the stable monotonic clock.
-            fallbackRealtimeNanoseconds +
-                (mediaTimestampMilliseconds - firstAudioTimestampMilliseconds) * 1_000_000L
+            val anchor = refreshAudioAnchorLocked() ?: return null
+            anchor.nanoTime +
+                (mediaTimestampMilliseconds - mediaTimestampAt(anchor)) * NANOS_PER_MILLISECOND
         }
 
-        fun isStarted(): Boolean = synchronized(lock) { track != null }
+        /** Video decoding may begin only after audio has supplied a real clock. */
+        fun isStarted(): Boolean = synchronized(lock) { refreshAudioAnchorLocked() != null }
 
         fun currentMediaTimestampMilliseconds(): Long? = synchronized(lock) {
-            if (track != null && fallbackRealtimeNanoseconds > 0) {
-                firstAudioTimestampMilliseconds +
-                    (System.nanoTime() - fallbackRealtimeNanoseconds) / 1_000_000L
-            } else {
-                null
-            }
+            val anchor = refreshAudioAnchorLocked() ?: return null
+            mediaTimestampAt(anchor) +
+                (System.nanoTime() - anchor.nanoTime) / NANOS_PER_MILLISECOND
         }
 
         fun reset() {
             synchronized(lock) {
                 track = null
-                fallbackRealtimeNanoseconds = 0
+                sampleRate = 0
+                playbackRequestedNanoseconds = 0
+                lastTimestampPollNanoseconds = 0
+                maximumObservedFramePosition = 0
+                timestampCandidate = null
+                timestampAnchor = null
+                playbackHeadAnchor = null
             }
+        }
+
+        /**
+         * Returns a mapping from an AudioTrack frame to CLOCK_MONOTONIC time.
+         *
+         * AudioTimestamp is the preferred source because Android defines its
+         * nanoTime as the time that frame was, or is committed to be, presented.
+         * Some Fire OS routes briefly return stale or multi-second-future values,
+         * so a timestamp is accepted only after two advancing samples agree with
+         * the configured sample rate and are reasonably close to System.nanoTime.
+         * Once accepted, this measured mapping—not independent queue arrival
+         * times—drives every SurfaceView video presentation timestamp.
+         *
+         * Android documents playbackHeadPosition as the approximate alternative
+         * when route timestamps are unavailable. We wait through a warm-up period
+         * before using it so video cannot race ahead while the audio device is
+         * still starting. A valid AudioTimestamp can replace the fallback later.
+         */
+        private fun refreshAudioAnchorLocked(): AudioAnchor? {
+            val activeTrack = track ?: return null
+            if (sampleRate <= 0 || playbackRequestedNanoseconds == 0L) return null
+            val now = System.nanoTime()
+            val pollInterval = if (timestampAnchor == null) {
+                TIMESTAMP_WARMUP_POLL_NANOSECONDS
+            } else {
+                TIMESTAMP_STABLE_POLL_NANOSECONDS
+            }
+
+            if (now - lastTimestampPollNanoseconds >= pollInterval) {
+                lastTimestampPollNanoseconds = now
+                val measured = AudioTimestamp()
+                val hasTimestamp = runCatching { activeTrack.getTimestamp(measured) }
+                    .getOrDefault(false)
+                if (hasTimestamp) {
+                    val framePosition = unwrapFramePosition(measured.framePosition)
+                    val sample = AudioAnchor(framePosition, measured.nanoTime)
+                    val closeToMonotonicNow =
+                        kotlin.math.abs(measured.nanoTime - now) <= MAX_TIMESTAMP_DISTANCE_NANOSECONDS
+                    val previous = timestampCandidate
+                    val advancesAtPlaybackRate = previous != null &&
+                        sample.framePosition > previous.framePosition &&
+                        sample.nanoTime > previous.nanoTime &&
+                        isExpectedPlaybackRate(previous, sample)
+
+                    // Do not let a rejected vendor timestamp move the 32-bit
+                    // wrap reference. A corrupt frame value could otherwise
+                    // make the trusted playback-head fallback appear one full
+                    // 2^32-frame epoch in the future.
+                    if (closeToMonotonicNow) {
+                        observeFramePosition(framePosition)
+                    }
+                    if (closeToMonotonicNow && advancesAtPlaybackRate) {
+                        timestampAnchor = sample
+                        if (!loggedTimestampAnchor) {
+                            loggedTimestampAnchor = true
+                            Log.i(
+                                TAG,
+                                "A/V clock anchored to AudioTrack timestamp " +
+                                    "frame=${sample.framePosition} " +
+                                    "offsetMs=${(sample.nanoTime - now) / NANOS_PER_MILLISECOND}",
+                            )
+                        }
+                    }
+                    timestampCandidate = if (closeToMonotonicNow) sample else null
+                }
+            }
+
+            timestampAnchor?.let { return it }
+
+            // Do not display video merely because play() was called. Give the
+            // output route time to expose the frame-to-time mapping that tells us
+            // when audio is actually presented.
+            if (now - playbackRequestedNanoseconds < AUDIO_CLOCK_WARMUP_NANOSECONDS) {
+                return null
+            }
+
+            val rawPlaybackHead = runCatching { activeTrack.playbackHeadPosition.toLong() }
+                .getOrDefault(0L)
+            val playedFrames = unwrapFramePosition(rawPlaybackHead)
+            if (playedFrames <= 0) return null
+            observeFramePosition(playedFrames)
+
+            val previousHeadAnchor = playbackHeadAnchor
+            if (previousHeadAnchor == null || playedFrames > previousHeadAnchor.framePosition) {
+                playbackHeadAnchor = AudioAnchor(playedFrames, now)
+            }
+            if (!loggedPlaybackHeadFallback) {
+                loggedPlaybackHeadFallback = true
+                Log.w(
+                    TAG,
+                    "AudioTrack timestamp unavailable after warm-up; " +
+                        "using playback-head clock at frame=$playedFrames",
+                )
+            }
+            return playbackHeadAnchor
+        }
+
+        private fun mediaTimestampAt(anchor: AudioAnchor): Long =
+            firstAudioTimestampMilliseconds +
+                anchor.framePosition * MILLIS_PER_SECOND / sampleRate
+
+        private fun isExpectedPlaybackRate(previous: AudioAnchor, current: AudioAnchor): Boolean {
+            val elapsedNanoseconds = current.nanoTime - previous.nanoTime
+            if (elapsedNanoseconds <= 0) return false
+            val measuredFramesPerSecond =
+                (current.framePosition - previous.framePosition).toDouble() * NANOS_PER_SECOND /
+                    elapsedNanoseconds.toDouble()
+            return measuredFramesPerSecond in
+                (sampleRate * MIN_VALID_RATE_RATIO)..(sampleRate * MAX_VALID_RATE_RATIO)
+        }
+
+        /** Expands Android's wrapping unsigned 32-bit audio frame counter. */
+        private fun unwrapFramePosition(rawPosition: Long): Long {
+            val lowBits = rawPosition and FRAME_POSITION_MASK
+            val reference = maximumObservedFramePosition
+            var candidate = (reference and FRAME_POSITION_HIGH_BITS_MASK) or lowBits
+            if (candidate + FRAME_POSITION_HALF_RANGE < reference) {
+                candidate += FRAME_POSITION_FULL_RANGE
+            } else if (candidate - FRAME_POSITION_HALF_RANGE > reference) {
+                candidate -= FRAME_POSITION_FULL_RANGE
+            }
+            return candidate.coerceAtLeast(0)
+        }
+
+        private fun observeFramePosition(framePosition: Long) {
+            maximumObservedFramePosition = maxOf(maximumObservedFramePosition, framePosition)
+        }
+
+        private data class AudioAnchor(
+            val framePosition: Long,
+            val nanoTime: Long,
+        )
+
+        private companion object {
+            const val NANOS_PER_MILLISECOND = 1_000_000L
+            const val NANOS_PER_SECOND = 1_000_000_000L
+            const val MILLIS_PER_SECOND = 1_000L
+            const val TIMESTAMP_WARMUP_POLL_NANOSECONDS = 20_000_000L
+            const val TIMESTAMP_STABLE_POLL_NANOSECONDS = 2_000_000_000L
+            const val AUDIO_CLOCK_WARMUP_NANOSECONDS = 300_000_000L
+            const val MAX_TIMESTAMP_DISTANCE_NANOSECONDS = 1_000_000_000L
+            const val MIN_VALID_RATE_RATIO = 0.80
+            const val MAX_VALID_RATE_RATIO = 1.20
+            const val FRAME_POSITION_MASK = 0xffff_ffffL
+            const val FRAME_POSITION_HIGH_BITS_MASK = -0x1_0000_0000L
+            const val FRAME_POSITION_HALF_RANGE = 0x8000_0000L
+            const val FRAME_POSITION_FULL_RANGE = 0x1_0000_0000L
         }
     }
 

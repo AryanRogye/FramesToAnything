@@ -34,3 +34,16 @@ android {
         jvmTarget = "17"
     }
 }
+
+dependencies {
+    testImplementation("junit:junit:4.13.2")
+}
+
+// This is the local and CI merge gate for the receiver's most important
+// playback invariant. Keep the named task stable so branch protection can
+// continue requiring it even if the underlying build is reorganized.
+tasks.register("verifyPlaybackSafety") {
+    group = "verification"
+    description = "Runs the A/V clock contract and builds both receiver APK variants."
+    dependsOn("testDebugUnitTest", "assembleDebug", "assembleRelease")
+}

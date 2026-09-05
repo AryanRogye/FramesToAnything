@@ -12,7 +12,6 @@ import CryptoKit
 import Foundation
 import Network
 import Security
-import UIKit
 
 /// Discovers the Mac sender, authenticates it with the displayed pairing code,
 /// and turns the encrypted TCP stream into decoded media packet callbacks.
@@ -34,9 +33,11 @@ nonisolated final class PairingService: @unchecked Sendable {
     ) -> Void
     typealias AudioConfigurationHandler = @MainActor @Sendable (
         _ sampleRate: Int,
-        _ channels: Int
+        _ channels: Int,
+        _ encoding: Int,
+        _ codecConfiguration: Data
     ) -> Void
-    typealias AudioFrameHandler = @MainActor @Sendable (Data) -> Void
+    typealias AudioFrameHandler = @MainActor @Sendable (Data, Int64) -> Void
     typealias MediaEndedHandler = @MainActor @Sendable () -> Void
 
     private let queue = DispatchQueue(
@@ -59,6 +60,7 @@ nonisolated final class PairingService: @unchecked Sendable {
     private var serverChallenge: Data?
     private var sessionKey: SymmetricKey?
     private var authenticated = false
+    private var negotiatedFeatures = Set<String>()
 
     private let onPairingCode: PairingCodeHandler
     private let onPairingRequest: PairingRequestHandler
@@ -68,17 +70,20 @@ nonisolated final class PairingService: @unchecked Sendable {
     private let onAudioConfiguration: AudioConfigurationHandler
     private let onAudioFrame: AudioFrameHandler
     private let onMediaEnded: MediaEndedHandler
+    private let receiverServiceName: String
 
     init(
+        receiverServiceName: String,
         onPairingCode: @escaping PairingCodeHandler,
         onPairingRequest: @escaping PairingRequestHandler = { _ in },
         onStatus: @escaping StatusHandler,
         onVideoConfiguration: @escaping VideoConfigurationHandler = { _, _, _, _, _ in },
         onVideoFrame: @escaping VideoFrameHandler = { _, _, _ in },
-        onAudioConfiguration: @escaping AudioConfigurationHandler = { _, _ in },
-        onAudioFrame: @escaping AudioFrameHandler = { _ in },
+        onAudioConfiguration: @escaping AudioConfigurationHandler = { _, _, _, _ in },
+        onAudioFrame: @escaping AudioFrameHandler = { _, _ in },
         onMediaEnded: @escaping MediaEndedHandler = {}
     ) {
+        self.receiverServiceName = receiverServiceName
         self.onPairingCode = onPairingCode
         self.onPairingRequest = onPairingRequest
         self.onStatus = onStatus
@@ -178,7 +183,7 @@ nonisolated final class PairingService: @unchecked Sendable {
         do {
             let listener = try NWListener(using: .tcp)
             listener.service = .init(
-                name: UIDevice.current.name,
+                name: receiverServiceName,
                 type: "_iosfiretv._tcp",
                 txtRecord: NWTXTRecord([
                     "id": Self.receiverID,
@@ -253,6 +258,7 @@ nonisolated final class PairingService: @unchecked Sendable {
                 "type": "hello",
                 "version": 1,
                 "receiverID": Self.receiverID,
+                "features": Array(Self.cinemaFeatures).sorted(),
                 "salt": salt.base64EncodedString(),
                 "challenge": challenge.base64EncodedString(),
             ],
@@ -376,6 +382,8 @@ nonisolated final class PairingService: @unchecked Sendable {
             TrustedSenderStore.save(trustSecret, for: senderID)
         }
 
+        let acceptedFeatures = Set(json["acceptedFeatures"] as? [String] ?? [])
+        negotiatedFeatures = acceptedFeatures.intersection(Self.cinemaFeatures)
         let serverProof = Self.authenticationCode(
             key: key,
             label: "server",
@@ -387,7 +395,13 @@ nonisolated final class PairingService: @unchecked Sendable {
         sessionKey = key
         authenticated = true
         sendJSON(
-            ["type": "auth_ok", "proof": serverProof.base64EncodedString()],
+            [
+                "type": "auth_ok",
+                "proof": serverProof.base64EncodedString(),
+                "acceptedFeatures": Array(
+                    negotiatedFeatures
+                ).sorted(),
+            ],
             on: connection
         ) { [weak self, weak connection] error in
             guard let self, let connection, connection === self.connection else { return }
@@ -437,7 +451,7 @@ nonisolated final class PairingService: @unchecked Sendable {
         case Self.mediaAudioConfiguration:
             try parseAudioConfiguration(media)
         case Self.mediaAudioFrame:
-            reportAudioFrame(media)
+            reportAudioFrame(media, timestamp: Int64(bitPattern: timestamp))
         default:
             break
         }
@@ -459,13 +473,59 @@ nonisolated final class PairingService: @unchecked Sendable {
         let sampleRate = Int(try reader.readUInt32())
         let channels = Int(try reader.readUInt8())
         let encoding = try reader.readUInt8()
-        guard reader.isAtEnd,
-              (8_000...192_000).contains(sampleRate),
+        let codecConfiguration = try reader.readRemainingData()
+        guard (8_000...192_000).contains(sampleRate),
               (1...2).contains(channels),
-              encoding == Self.audioPCM16 else {
+              (encoding == Self.audioPCM16 || encoding == Self.audioAACLC),
+              encoding == Self.audioPCM16 || !codecConfiguration.isEmpty else {
             throw PairingError.unsupportedAudioConfiguration
         }
-        reportAudioConfiguration(sampleRate: sampleRate, channels: channels)
+        reportAudioConfiguration(
+            sampleRate: sampleRate,
+            channels: channels,
+            encoding: encoding,
+            codecConfiguration: codecConfiguration
+        )
+    }
+
+    func sendReceiverReport(_ report: iOSCinemaPlaybackReport) {
+        queue.async { [weak self] in
+            guard let self,
+                  authenticated,
+                  negotiatedFeatures.contains("receiver-report-v1"),
+                  let connection else { return }
+            sendJSON(
+                [
+                    "type": "receiver_report",
+                    "version": 1,
+                    "videoBufferMs": report.videoBufferMilliseconds,
+                    "audioBufferMs": report.audioBufferMilliseconds,
+                    "decoderBacklogMs": report.decoderBacklogMilliseconds,
+                    "underruns": report.underruns,
+                    "recoveries": report.recoveries,
+                    "lastPresentedTimestampMs": report.lastPresentedTimestampMilliseconds,
+                ],
+                on: connection
+            )
+        }
+    }
+
+    func requestKeyFrame(reason: String, lastPresentedTimestampMilliseconds: Int64) {
+        queue.async { [weak self] in
+            guard let self,
+                  authenticated,
+                  negotiatedFeatures.contains("keyframe-request-v1"),
+                  let connection else { return }
+            sendJSON(
+                [
+                    "type": "request_keyframe",
+                    "version": 1,
+                    "reason": reason,
+                    "lastPresentedTimestampMs": lastPresentedTimestampMilliseconds,
+                ],
+                on: connection
+            )
+        }
     }
 
     private func sendJSON(
@@ -531,6 +591,7 @@ nonisolated final class PairingService: @unchecked Sendable {
         serverChallenge = nil
         sessionKey = nil
         authenticated = false
+        negotiatedFeatures.removeAll(keepingCapacity: true)
     }
 
     private func rotatePairingCode() {
@@ -565,14 +626,21 @@ nonisolated final class PairingService: @unchecked Sendable {
         Task { @MainActor in callback(data, timestamp, isKeyFrame) }
     }
 
-    private func reportAudioConfiguration(sampleRate: Int, channels: Int) {
+    private func reportAudioConfiguration(
+        sampleRate: Int,
+        channels: Int,
+        encoding: UInt8,
+        codecConfiguration: Data
+    ) {
         let callback = onAudioConfiguration
-        Task { @MainActor in callback(sampleRate, channels) }
+        Task { @MainActor in
+            callback(sampleRate, channels, Int(encoding), codecConfiguration)
+        }
     }
 
-    private func reportAudioFrame(_ data: Data) {
+    private func reportAudioFrame(_ data: Data, timestamp: Int64) {
         let callback = onAudioFrame
-        Task { @MainActor in callback(data) }
+        Task { @MainActor in callback(data, timestamp) }
     }
 
     private func reportMediaEnded() {
@@ -727,6 +795,10 @@ nonisolated final class PairingService: @unchecked Sendable {
             defer { offset += count }
             return data.subdata(in: offset..<(offset + count))
         }
+
+        mutating func readRemainingData() throws -> Data {
+            try readData(count: data.count - offset)
+        }
     }
 
     private static let macServiceType = "_framesmac._tcp"
@@ -739,12 +811,19 @@ nonisolated final class PairingService: @unchecked Sendable {
     private static let mediaAudioConfiguration: UInt8 = 3
     private static let mediaAudioFrame: UInt8 = 4
     private static let audioPCM16: UInt8 = 1
+    private static let audioAACLC: UInt8 = 2
     private static let gcmNonceBytes = 12
     private static let pbkdf2Iterations = 120_000
     private static let connectTimeoutMilliseconds = 5_000
     private static let reconnectDelayMilliseconds = 1_500
     private static let maximumJSONPacketBytes: UInt32 = 64 * 1024
     private static let maximumFramePacketBytes: UInt32 = 8 * 1024 * 1024
+    private static let cinemaFeatures: Set<String> = [
+        "cinema-buffer-v1",
+        "receiver-report-v1",
+        "keyframe-request-v1",
+        "aac-lc-v1",
+    ]
 }
 
 private enum TrustedSenderStore {

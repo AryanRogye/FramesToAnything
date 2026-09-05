@@ -2,6 +2,7 @@
 
 import Observation
 import SwiftUI
+import UIKit
 
 struct iOSReceiverView: View {
     @Environment(\.scenePhase) private var scenePhase
@@ -174,7 +175,7 @@ private struct FullScreenMacVideo: View {
     var body: some View {
         ZStack(alignment: .topTrailing) {
             Color.black.ignoresSafeArea()
-            iOSVideoSurface(player: player, fillScreen: false)
+            iOSVideoSurface(player: player)
                 .ignoresSafeArea()
 
             Button {
@@ -208,6 +209,7 @@ final class iOSPairingModel {
 
     @ObservationIgnored
     private lazy var pairingService = PairingService(
+        receiverServiceName: UIDevice.current.name,
         onPairingCode: { [weak self] code in
             self?.pairingCode = code
         },
@@ -218,14 +220,8 @@ final class iOSPairingModel {
             self?.status = status
             self?.isStreaming = streaming
         },
-        onVideoConfiguration: { [weak self] width, height, rotation, sps, pps in
-            self?.player.configureVideo(
-                width: width,
-                height: height,
-                rotationDegrees: rotation,
-                sps: sps,
-                pps: pps
-            )
+        onVideoConfiguration: { [weak self] _, _, _, sps, pps in
+            self?.player.configureVideo(sps: sps, pps: pps)
         },
         onVideoFrame: { [weak self] data, timestamp, isKeyFrame in
             self?.player.enqueueVideo(
@@ -234,11 +230,16 @@ final class iOSPairingModel {
                 isKeyFrame: isKeyFrame
             )
         },
-        onAudioConfiguration: { [weak self] sampleRate, channels in
-            self?.player.configureAudio(sampleRate: sampleRate, channels: channels)
+        onAudioConfiguration: { [weak self] sampleRate, channels, encoding, codecConfiguration in
+            self?.player.configureAudio(
+                sampleRate: sampleRate,
+                channels: channels,
+                encoding: encoding,
+                codecConfiguration: codecConfiguration
+            )
         },
-        onAudioFrame: { [weak self] data in
-            self?.player.enqueueAudio(data)
+        onAudioFrame: { [weak self] data, timestamp in
+            self?.player.enqueueAudio(data, timestampMilliseconds: timestamp)
         },
         onMediaEnded: { [weak self] in
             self?.player.reset()
@@ -266,6 +267,15 @@ final class iOSPairingModel {
     func start() {
         guard !hasStarted else { return }
         hasStarted = true
+        player.onReport = { [weak self] report in
+            self?.pairingService.sendReceiverReport(report)
+        }
+        player.onKeyFrameNeeded = { [weak self] reason, lastPresentedTimestamp in
+            self?.pairingService.requestKeyFrame(
+                reason: reason,
+                lastPresentedTimestampMilliseconds: lastPresentedTimestamp
+            )
+        }
         pairingService.start()
     }
 

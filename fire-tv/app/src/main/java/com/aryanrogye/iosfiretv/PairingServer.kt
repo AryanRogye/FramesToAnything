@@ -8,6 +8,7 @@ import android.provider.Settings
 import android.util.Base64
 import android.util.Log
 import org.json.JSONObject
+import org.json.JSONArray
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.DataInputStream
@@ -47,8 +48,8 @@ class PairingServer(
             pps: ByteArray,
         )
         fun onVideoFrame(data: ByteArray, timestampMilliseconds: Long, keyFrame: Boolean)
-        fun onAudioConfiguration(sampleRate: Int, channels: Int)
-        fun onAudioFrame(pcm: ByteArray)
+        fun onAudioConfiguration(sampleRate: Int, channels: Int, encoding: Int, codecConfig: ByteArray)
+        fun onAudioFrame(data: ByteArray, timestampMilliseconds: Long)
         fun onMediaEnded()
     }
 
@@ -64,6 +65,11 @@ class PairingServer(
     private var clientSocket: Socket? = null
     @Volatile
     private var serverSocket: ServerSocket? = null
+    @Volatile
+    private var activeOutput: DataOutputStream? = null
+    @Volatile
+    private var negotiatedFeatures: Set<String> = emptySet()
+    private val outputLock = Any()
     private var discoveryListener: NsdManager.DiscoveryListener? = null
     private var registrationListener: NsdManager.RegistrationListener? = null
     @Volatile
@@ -126,6 +132,15 @@ class PairingServer(
                     .put("type", "hello")
                     .put("version", 1)
                     .put("receiverID", receiverID)
+                    .put(
+                        "features",
+                        JSONArray()
+                            .put(FEATURE_CINEMA_BUFFER)
+                            .put(FEATURE_RECEIVER_REPORTS)
+                            .put(FEATURE_KEYFRAME_REQUEST)
+                            .put(FEATURE_AAC_LC)
+                            .put(FEATURE_REMOTE_MEDIA_CONTROLS),
+                    )
                     .put("salt", encode(salt))
                     .put("challenge", encode(serverChallenge)),
             )
@@ -135,6 +150,15 @@ class PairingServer(
             val deviceName = auth.optString("name").trim().takeIf { it.isNotEmpty() }
             val senderID = auth.optString("senderID").trim().takeIf { it.isNotEmpty() }
             val mode = auth.optString("mode", "code")
+            val requestedFeatures = buildSet {
+                val values = auth.optJSONArray("acceptedFeatures")
+                if (values != null) {
+                    for (index in 0 until values.length()) {
+                        values.optString(index).takeIf { it.isNotEmpty() }?.let(::add)
+                    }
+                }
+            }
+            negotiatedFeatures = requestedFeatures.intersect(SUPPORTED_FEATURES)
             Log.i(TAG, "authentication request from ${deviceName ?: "unknown device"}")
             listener.onPairingRequest(deviceName)
             val clientChallenge = decode(auth.getString("challenge"))
@@ -199,10 +223,12 @@ class PairingServer(
                 output,
                 JSONObject()
                     .put("type", "auth_ok")
-                    .put("proof", encode(serverProof)),
+                    .put("proof", encode(serverProof))
+                    .put("acceptedFeatures", JSONArray(negotiatedFeatures.toList().sorted())),
             )
 
             socket.soTimeout = 0
+            activeOutput = output
             Log.i(TAG, "authentication succeeded for ${deviceName ?: "unknown device"}")
             listener.onStatus("Streaming display and audio", true)
             readMedia(input, key)
@@ -213,6 +239,8 @@ class PairingServer(
                 listener.onStatus("Connection ended: ${error.message ?: "unknown"}", false)
             }
         } finally {
+            if (activeOutput === output) activeOutput = null
+            negotiatedFeatures = emptySet()
             listener.onMediaEnded()
             runCatching { socket.close() }
         }
@@ -280,7 +308,7 @@ class PairingServer(
                 MEDIA_VIDEO_CONFIGURATION -> parseVideoConfiguration(media)
                 MEDIA_VIDEO_FRAME -> listener.onVideoFrame(media, timestamp, keyFrame)
                 MEDIA_AUDIO_CONFIGURATION -> parseAudioConfiguration(media)
-                MEDIA_AUDIO_FRAME -> listener.onAudioFrame(media)
+                MEDIA_AUDIO_FRAME -> listener.onAudioFrame(media, timestamp)
             }
         }
     }
@@ -308,10 +336,58 @@ class PairingServer(
         val sampleRate = input.int
         val channels = input.get().toInt() and 0xff
         val encoding = input.get().toInt() and 0xff
-        require(sampleRate in 8_000..192_000 && channels in 1..2 && encoding == AUDIO_PCM_16) {
+        require(
+            sampleRate in 8_000..192_000 && channels in 1..2 &&
+                (encoding == AUDIO_PCM_16 || encoding == AUDIO_AAC_LC) &&
+                (encoding == AUDIO_PCM_16 || input.remaining() > 0)
+        ) {
             "Unsupported audio configuration"
         }
-        listener.onAudioConfiguration(sampleRate, channels)
+        val codecConfig = ByteArray(input.remaining()).also(input::get)
+        listener.onAudioConfiguration(sampleRate, channels, encoding, codecConfig)
+    }
+
+    fun sendReceiverReport(report: CinemaPlaybackReport) {
+        if (!negotiatedFeatures.contains(FEATURE_RECEIVER_REPORTS)) return
+        val output = activeOutput ?: return
+        val message = JSONObject()
+            .put("type", "receiver_report")
+            .put("version", 1)
+            .put("videoBufferMs", report.videoBufferMilliseconds)
+            .put("audioBufferMs", report.audioBufferMilliseconds)
+            .put("decoderBacklogMs", report.decoderBacklogMilliseconds)
+            .put("underruns", report.underruns)
+            .put("recoveries", report.recoveries)
+            .put("lastPresentedTimestampMs", report.lastPresentedTimestampMilliseconds)
+        synchronized(outputLock) {
+            runCatching { writeJson(output, message) }
+        }
+    }
+
+    fun requestKeyFrame(reason: String, lastPresentedTimestampMilliseconds: Long) {
+        if (!negotiatedFeatures.contains(FEATURE_KEYFRAME_REQUEST)) return
+        val output = activeOutput ?: return
+        val message = JSONObject()
+            .put("type", "request_keyframe")
+            .put("version", 1)
+            .put("reason", reason)
+            .put("lastPresentedTimestampMs", lastPresentedTimestampMilliseconds)
+        synchronized(outputLock) {
+            runCatching { writeJson(output, message) }
+        }
+    }
+
+    fun sendRemoteMediaCommand(command: String) {
+        if (!negotiatedFeatures.contains(FEATURE_REMOTE_MEDIA_CONTROLS)) return
+        if (command != REMOTE_COMMAND_TOGGLE_PLAY_PAUSE) return
+        val output = activeOutput ?: return
+        val message = JSONObject()
+            .put("type", "remote_media_command")
+            .put("version", 1)
+            .put("command", command)
+        synchronized(outputLock) {
+            runCatching { writeJson(output, message) }
+        }
     }
 
     private fun discoverMacSender() {
@@ -542,9 +618,32 @@ class PairingServer(
         const val MEDIA_AUDIO_CONFIGURATION = 3
         const val MEDIA_AUDIO_FRAME = 4
         const val AUDIO_PCM_16 = 1
+        const val AUDIO_AAC_LC = 2
         const val GCM_NONCE_BYTES = 12
         const val PBKDF2_ITERATIONS = 120_000
         const val MAX_JSON_PACKET_BYTES = 64 * 1024
         const val MAX_FRAME_PACKET_BYTES = 8 * 1024 * 1024
+        const val FEATURE_CINEMA_BUFFER = "cinema-buffer-v1"
+        const val FEATURE_RECEIVER_REPORTS = "receiver-report-v1"
+        const val FEATURE_KEYFRAME_REQUEST = "keyframe-request-v1"
+        const val FEATURE_AAC_LC = "aac-lc-v1"
+        const val FEATURE_REMOTE_MEDIA_CONTROLS = "remote-media-controls-v1"
+        const val REMOTE_COMMAND_TOGGLE_PLAY_PAUSE = "toggle_play_pause"
+        val SUPPORTED_FEATURES = setOf(
+            FEATURE_CINEMA_BUFFER,
+            FEATURE_RECEIVER_REPORTS,
+            FEATURE_KEYFRAME_REQUEST,
+            FEATURE_AAC_LC,
+            FEATURE_REMOTE_MEDIA_CONTROLS,
+        )
     }
 }
+
+data class CinemaPlaybackReport(
+    val videoBufferMilliseconds: Long,
+    val audioBufferMilliseconds: Long,
+    val decoderBacklogMilliseconds: Long,
+    val underruns: Long,
+    val recoveries: Long,
+    val lastPresentedTimestampMilliseconds: Long,
+)

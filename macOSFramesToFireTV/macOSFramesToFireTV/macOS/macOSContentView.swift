@@ -43,10 +43,18 @@ struct MacMenuBarContent: View {
                 showPairingWindow()
             }
             .disabled(model.isStreaming || model.isBusy)
+
+            if model.selectedReceiverIsRemembered {
+                Button("Reset Connection & Pair Again…", systemImage: "arrow.counterclockwise") {
+                    model.resetSelectedReceiverForPairing()
+                    showPairingWindow()
+                }
+                .disabled(model.isStreaming)
+            }
         }
 
         Section("Stream") {
-            Picker("Quality", selection: $model.selectedQuality) {
+            Picker("Maximum Quality", selection: $model.selectedQuality) {
                 ForEach(MacStreamQuality.allCases) { quality in
                     Text("\(quality.label) · \(quality.bandwidth)")
                         .tag(quality)
@@ -180,8 +188,12 @@ final class MacStreamingModel {
     var pairingCode = ""
     var connectionState: MacFireTVConnectionState = .searching
     var selectedQuality: MacStreamQuality = .fullHD
+    private(set) var activeQuality: MacStreamQuality = .fullHD
+    private(set) var activeBitRate = 10_000_000
     var isStreaming = false
     private var isStopping = false
+    private var isApplyingAdaptiveQuality = false
+    private var pendingAdaptiveQuality: (MacStreamQuality, Int)?
 
     init() {
         transport.onDevicesChanged = { [weak self] devices in
@@ -194,13 +206,23 @@ final class MacStreamingModel {
         transport.onStateChanged = { [weak self] state in
             guard let self else { return }
             self.connectionState = state
-            if case .failed = state { self.isStreaming = false }
-            if state == .disconnected { self.isStreaming = false }
+            if case .failed = state {
+                self.isStreaming = false
+                Task { await self.capture.stopRecording() }
+            }
+            if state == .disconnected {
+                self.isStreaming = false
+                Task { await self.capture.stopRecording() }
+            }
+        }
+        transport.onAdaptiveQualityChanged = { [weak self] quality, bitRate in
+            self?.applyAdaptiveQuality(quality, bitRate: bitRate)
         }
         capture.onScreenFrame = { [weak self] frame in
             guard frame.shouldAppend,
                   let imageBuffer = frame.imageBuffer,
                   let self else { return }
+            guard self.connectionState.isConnected else { return }
             self.transport.sendVideo(
                 imageBuffer,
                 timestamp: frame.presentationTimeStamp
@@ -316,15 +338,57 @@ final class MacStreamingModel {
         }
     }
 
+    func resetSelectedReceiverForPairing() {
+        guard let selectedDevice else { return }
+        transport.forgetSavedConnection(to: selectedDevice)
+        pairingCode = ""
+        connectionState = .disconnected
+    }
+
     func startStreaming() {
         guard connectionState.isConnected else { return }
-        transport.configureVideo(averageBitRate: selectedQuality.averageBitRate)
+        activeQuality = selectedQuality
+        activeBitRate = selectedQuality.averageBitRate
+        transport.configureVideo(maximumQuality: selectedQuality)
         capture.startRecording(
             scale: selectedQuality.captureScale,
             showsCursor: true,
             capturesAudio: true,
             fps: .fps60
         )
+    }
+
+    private func applyAdaptiveQuality(_ quality: MacStreamQuality, bitRate: Int) {
+        activeBitRate = bitRate
+        guard isStreaming, quality != activeQuality else {
+            activeQuality = quality
+            return
+        }
+        guard !isApplyingAdaptiveQuality else {
+            pendingAdaptiveQuality = (quality, bitRate)
+            return
+        }
+        isApplyingAdaptiveQuality = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await capture.stopRecording()
+            activeQuality = quality
+            guard !isStopping, connectionState.isConnected else {
+                isApplyingAdaptiveQuality = false
+                return
+            }
+            capture.startRecording(
+                scale: quality.captureScale,
+                showsCursor: true,
+                capturesAudio: true,
+                fps: .fps60
+            )
+            isApplyingAdaptiveQuality = false
+            if let pending = pendingAdaptiveQuality {
+                pendingAdaptiveQuality = nil
+                applyAdaptiveQuality(pending.0, bitRate: pending.1)
+            }
+        }
     }
 
     func stopStreaming() {

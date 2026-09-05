@@ -138,7 +138,11 @@ class PairingServer(
                             .put(FEATURE_CINEMA_BUFFER)
                             .put(FEATURE_RECEIVER_REPORTS)
                             .put(FEATURE_KEYFRAME_REQUEST)
-                            .put(FEATURE_AAC_LC)
+                            // Raw AAC in this protocol carries no encoder-delay
+                            // or trim metadata. The Mac assigns input PCM PTS to
+                            // primed AAC output, so decoded sound can lag video
+                            // even with a correct device clock. Negotiate PCM
+                            // until AAC priming is represented end to end.
                             .put(FEATURE_REMOTE_MEDIA_CONTROLS),
                     )
                     .put("salt", encode(salt))
@@ -355,6 +359,7 @@ class PairingServer(
             .put("version", 1)
             .put("videoBufferMs", report.videoBufferMilliseconds)
             .put("audioBufferMs", report.audioBufferMilliseconds)
+            .put("targetBufferMs", report.targetBufferMilliseconds)
             .put("decoderBacklogMs", report.decoderBacklogMilliseconds)
             .put("underruns", report.underruns)
             .put("recoveries", report.recoveries)
@@ -633,7 +638,6 @@ class PairingServer(
             FEATURE_CINEMA_BUFFER,
             FEATURE_RECEIVER_REPORTS,
             FEATURE_KEYFRAME_REQUEST,
-            FEATURE_AAC_LC,
             FEATURE_REMOTE_MEDIA_CONTROLS,
         )
     }
@@ -646,4 +650,5 @@ data class CinemaPlaybackReport(
     val underruns: Long,
     val recoveries: Long,
     val lastPresentedTimestampMilliseconds: Long,
+    val targetBufferMilliseconds: Long = 180L,
 )

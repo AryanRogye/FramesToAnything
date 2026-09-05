@@ -3,14 +3,8 @@ name: Fire TV playback safety
 on:
   pull_request:
     branches: [main]
-    paths:
-      - "fire-tv/**"
-      - ".github/workflows/fire-tv-playback.yml"
   push:
     branches: [main]
-    paths:
-      - "fire-tv/**"
-      - ".github/workflows/fire-tv-playback.yml"
 
 # A newer push makes the older result irrelevant. Cancelling it also prevents a
 # stale successful run from being mistaken for validation of the latest commit.
@@ -22,6 +16,14 @@ permissions:
   contents: read
 
 jobs:
+  sender-buffer-policy:
+    name: Mac sender buffer policy
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Test the sender against Fire TV and iOS buffer targets
+        run: swift test --package-path macOSFramesToFireTV
+
   av-sync-contract:
     name: A/V sync contract and APK builds
     runs-on: ubuntu-latest

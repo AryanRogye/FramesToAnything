@@ -536,24 +536,31 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
         let decoderBacklog = object["decoderBacklogMs"] as? Int ?? 0
         let underruns = object["underruns"] as? Int ?? lastUnderruns
         let recoveries = object["recoveries"] as? Int ?? lastRecoveries
-        let effectiveBuffer = min(videoBuffer, audioBuffer)
+        // Older receivers omit the target and used the original 750 ms buffer.
+        // New Fire TV reports its 180 ms target so healthy low latency playback
+        // does not trigger a resolution change and stop/start ScreenCaptureKit.
+        let health = ReceiverBufferPolicy.classify(
+            video: videoBuffer, audio: audioBuffer, backlog: decoderBacklog,
+            target: object["targetBufferMs"] as? Int ?? 750,
+            newUnderruns: underruns > lastUnderruns,
+            newRecoveries: recoveries > lastRecoveries
+        )
         let now = ContinuousClock.now
 
-        if effectiveBuffer < 200 {
+        if health == .starved {
             stepQualityDown(now: now)
             lowBufferReports = 0
             healthySince = nil
-        } else if effectiveBuffer < 450 || decoderBacklog > 250 {
+        } else if health == .low {
             lowBufferReports += 1
             healthySince = nil
-            if lowBufferReports >= 2 {
+            if lowBufferReports >= 4 {
                 stepQualityDown(now: now)
                 lowBufferReports = 0
             }
         } else {
             lowBufferReports = 0
-            let remainedHealthy = effectiveBuffer >= 650 && decoderBacklog < 100 &&
-                underruns == lastUnderruns && recoveries == lastRecoveries
+            let remainedHealthy = health == .healthy
             if remainedHealthy {
                 healthySince = healthySince ?? now
                 if let healthySince,

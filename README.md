@@ -113,8 +113,8 @@ The Kotlin Fire TV / Android TV receiver:
 - Displays and rotates a six-digit pairing code.
 - Decrypts media using AES-GCM.
 - Decodes H.264 with Android `MediaCodec` onto a `Surface`.
-- Prefers AAC-LC audio and retains PCM as a negotiated fallback.
-- Uses an audio-clocked 750 ms cinema buffer and timestamped `SurfaceView`
+- Negotiates PCM audio so timestamps do not include unreported AAC priming delay.
+- Uses a 180 ms startup buffer and timestamped `SurfaceView`
   presentation to avoid partial-frame updates and decoder corruption.
 - For negotiated Mac sessions, routes the Fire TV remote's play/pause button
   to the Mac system media key so browser video responds normally.
@@ -199,13 +199,31 @@ and reset behavior. The GitHub workflow is named `Fire TV playback safety`; make
 its `A/V sync contract and APK builds` check required in the `main` branch
 protection rules so a failing or skipped result cannot be merged.
 
+Test the Mac's buffer policy too: `swift test --package-path macOSFramesToFireTV`.
+CI runs it on every PR to main, including sender-only changes. The sender uses
+the receiver's `targetBufferMs` report field (750 ms for older receivers that
+omit it) so a healthy 180 ms Fire TV buffer does not trigger capture restarts.
+
+Fire TV currently negotiates 16-bit PCM because the AAC wire format does not
+carry encoder priming/trim metadata. At 48 kHz stereo this uses about 1.54 Mbps
+for audio. PCM packet timestamp gaps cause audio to rebuffer on a fresh timeline;
+repeated identical H.264 configuration packets preserve the existing decoder.
+
+These checks verify software timing rules; they do not measure sound reaching
+the listener. Before releasing playback changes, run a paired Mac-to-Fire TV
+lip-sync clip through cold start, at least two minutes of playback, pause/resume,
+and reconnect. Check for blackouts and persistent audio lead/lag as well as
+`FireTVMedia` clock-gap/recovery logs. A successful APK launch alone is not a
+playback synchronization test.
+
 ## Media pipeline
 
 ### Cinema playback
 
 Mac-to-receiver sessions default to a playback-first pipeline:
 
-- The receiver accumulates about 750 ms of audio and video before starting.
+- iOS accumulates about 750 ms before starting; Fire TV buffers 180 ms of audio
+  and waits for an advancing playback position before presenting video.
 - Audio is the playback clock; video presentation timestamps are scheduled
   against that clock instead of being displayed immediately on arrival.
 - Sender and receiver queues preserve H.264 dependency order under normal

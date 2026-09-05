@@ -77,6 +77,19 @@ class FireTVMediaPlayer(
         sps: ByteArray,
         pps: ByteArray,
     ) {
+        val previous = videoConfiguration
+        if (previous != null && previous.width == width && previous.height == height &&
+            previous.rotationDegrees == rotationDegrees &&
+            previous.sps.contentEquals(sps) && previous.pps.contentEquals(pps) &&
+            synchronized(decoderLock) { decoder != null }
+        ) {
+            // The Mac resends SPS/PPS after a bitrate change or keyframe
+            // request. An identical format does not require a decoder restart:
+            // stopping the codec here clears the Surface and causes a blackout.
+            Log.d(TAG, "Keeping decoder for repeated video configuration ${width}x$height")
+            return
+        }
+        Log.i(TAG, "Configuring video decoder ${width}x$height")
         videoConfiguration = VideoConfiguration(
             width,
             height,
@@ -365,7 +378,7 @@ class FireTVMediaPlayer(
                     Thread.sleep(AUDIO_POLL_MILLISECONDS)
                     continue
                 }
-                if (packet.timestampMilliseconds <
+                if (firstAudioTimestampMilliseconds == null && packet.timestampMilliseconds <
                     firstVideoTimestamp - STARTUP_SYNC_TOLERANCE_MILLISECONDS
                 ) {
                     // Screen/audio capture can begin before VideoToolbox emits
@@ -442,8 +455,26 @@ class FireTVMediaPlayer(
         }
     }
 
-    private fun writePCM(data: ByteArray, timestampMilliseconds: Long) {
-        val track = synchronized(audioLock) { audioTrack } ?: return
+    private fun writePCM(data: ByteArray, timestampMilliseconds: Long) = synchronized(audioLock) {
+        val track = audioTrack ?: return
+        val firstPts = firstAudioTimestampMilliseconds
+        if (firstPts != null && PcmTimeline.isDiscontinuous(
+                firstPts, audioFramesWritten, audioSampleRate, timestampMilliseconds,
+            )
+        ) {
+            // AudioTrack counts only frames submitted, not time missing from
+            // capture. After a Mac capture restart (or queue loss), appending
+            // new PCM against the old origin would permanently offset sound.
+            // stop + flush resets the frame counter; reacquire a clock from the
+            // new packet's actual PTS and buffer audio before resuming video.
+            Log.w(TAG, "Audio capture timeline gap at $timestampMilliseconds; rebuffering")
+            clock.reset()
+            track.pause()
+            track.flush()
+            track.stop()
+            audioFramesWritten = 0
+            firstAudioTimestampMilliseconds = null
+        }
         if (firstAudioTimestampMilliseconds == null) {
             firstAudioTimestampMilliseconds = timestampMilliseconds
         }
@@ -515,6 +546,7 @@ class FireTVMediaPlayer(
             },
             recoveries = synchronized(this) { recoveries },
             lastPresentedTimestampMilliseconds = lastPresentedTimestampMilliseconds,
+            targetBufferMilliseconds = TARGET_BUFFER_MILLISECONDS,
         )
     }
 

@@ -23,6 +23,13 @@ class FireTVMediaPlayer(
     private val running = AtomicBoolean(true)
     private val decoderLock = Any()
     private val audioLock = Any()
+    // Decoder callbacks must never acquire the player lifecycle monitor (`this`).
+    // configureVideo/reset hold that monitor while acquiring decoderLock; taking
+    // them in reverse order on a dropped frame deadlocks the network reader and
+    // decoder, stops incoming audio, and looks like a failed connection.
+    // This short-lived lock protects counters/recovery state only and is always
+    // released before waiting for a decoder or audio operation.
+    private val playbackStateLock = Any()
     private val clock = AudioVideoClock(
         onInfo = { Log.i(TAG, it) },
         onWarning = { Log.w(TAG, it) },
@@ -34,6 +41,7 @@ class FireTVMediaPlayer(
     private var decoder: MediaCodec? = null
     private var audioDecoder: MediaCodec? = null
     private var audioTrack: AudioTrack? = null
+    private var audioStreamFormat: AudioStreamFormat? = null
     private var videoConfiguration: VideoConfiguration? = null
     private var audioSampleRate = 0
     private var audioChannels = 0
@@ -115,7 +123,7 @@ class FireTVMediaPlayer(
     fun queueVideo(data: ByteArray, timestampMilliseconds: Long, keyFrame: Boolean) {
         if (!running.get()) return
         lastReceivedVideoTimestampMilliseconds = timestampMilliseconds
-        synchronized(this) {
+        synchronized(playbackStateLock) {
             if (waitingForKeyFrame && !keyFrame) return
             if (keyFrame) waitingForKeyFrame = false
         }
@@ -133,7 +141,7 @@ class FireTVMediaPlayer(
         if (!videoQueue.offerLast(frame)) {
             enterRecovery("video_queue_overflow")
             if (keyFrame) {
-                synchronized(this) { waitingForKeyFrame = false }
+                synchronized(playbackStateLock) { waitingForKeyFrame = false }
                 videoQueue.offerLast(frame)
             }
         }
@@ -141,6 +149,16 @@ class FireTVMediaPlayer(
 
     @Synchronized
     fun configureAudio(sampleRate: Int, channels: Int, encoding: Int, codecConfig: ByteArray) {
+        val incomingFormat = AudioStreamFormat(sampleRate, channels.coerceIn(1, 2), encoding, codecConfig)
+        if (encoding == AUDIO_PCM_16 && audioStreamFormat?.matches(incomingFormat) == true) {
+            // A video recovery makes the Mac announce audio again. Resetting
+            // identical PCM here discards audible samples and requests another
+            // video recovery, creating a self-sustaining reset/stutter loop.
+            // PCM packet PTS still detect genuine capture gaps in writePCM.
+            // AAC is excluded: a new encoder may have different priming state.
+            Log.d(TAG, "Keeping audio track for repeated PCM configuration")
+            return
+        }
         val requiresPlaybackRecovery = clock.isStarted()
         releaseAudio()
         audioQueue.clear()
@@ -198,6 +216,7 @@ class FireTVMediaPlayer(
             }
         }
         audioEncoding = encoding
+        audioStreamFormat = incomingFormat
         audioFramesWritten = 0
         firstAudioTimestampMilliseconds = null
         if (requiresPlaybackRecovery) {
@@ -211,7 +230,7 @@ class FireTVMediaPlayer(
         if (!audioQueue.offerLast(packet)) {
             audioQueue.pollFirst()
             audioQueue.offerLast(packet)
-            synchronized(this) { underruns += 1 }
+            synchronized(playbackStateLock) { underruns += 1 }
             Log.w(TAG, "audio queue exceeded the low-latency window")
         }
     }
@@ -290,7 +309,12 @@ class FireTVMediaPlayer(
         while (running.get()) {
             val accepted = synchronized(decoderLock) {
                 val codec = decoder ?: return
-                val inputIndex = codec.dequeueInputBuffer(CODEC_DEQUEUE_MICROSECONDS)
+                // Output buffers can hold all decoder resources while waiting
+                // for the Surface. Drain them before asking for input space;
+                // a blocking 10 ms input wait here throttles every frame when
+                // the codec is full and eventually overflows the video queue.
+                drainVideoLocked(codec)
+                val inputIndex = codec.dequeueInputBuffer(0)
                 if (inputIndex < 0) {
                     drainVideoLocked(codec)
                     false
@@ -315,6 +339,7 @@ class FireTVMediaPlayer(
                 }
             }
             if (accepted) return
+            Thread.sleep(1)
         }
     }
 
@@ -333,7 +358,7 @@ class FireTVMediaPlayer(
                         codec.releaseOutputBuffer(outputIndex, false)
                     } else if (renderTime < System.nanoTime() - STALE_VIDEO_NANOSECONDS) {
                         codec.releaseOutputBuffer(outputIndex, false)
-                        synchronized(this) { underruns += 1 }
+                        synchronized(playbackStateLock) { underruns += 1 }
                     } else {
                         codec.releaseOutputBuffer(outputIndex, renderTime)
                         lastPresentedTimestampMilliseconds = timestampMilliseconds
@@ -509,11 +534,16 @@ class FireTVMediaPlayer(
     }
 
     private fun enterRecovery(reason: String) {
-        videoQueue.clear()
-        synchronized(this) {
+        synchronized(playbackStateLock) {
+            // Many packets can hit a full queue before the requested keyframe
+            // returns. One outstanding recovery is enough; repeated requests
+            // restart both encoders and prevent either pipeline from settling.
+            if (waitingForKeyFrame) return
             waitingForKeyFrame = true
             recoveries += 1
         }
+        Log.w(TAG, "Video recovery requested: $reason")
+        videoQueue.clear()
         synchronized(decoderLock) { runCatching { decoder?.flush() } }
         requestKeyFrame(reason)
     }
@@ -539,12 +569,12 @@ class FireTVMediaPlayer(
             videoBufferMilliseconds = queuedVideo,
             audioBufferMilliseconds = queuedAudio + trackBuffered,
             decoderBacklogMilliseconds = decoderBacklog,
-            underruns = synchronized(this) { underruns } + synchronized(audioLock) {
+            underruns = synchronized(playbackStateLock) { underruns } + synchronized(audioLock) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                     audioTrack?.underrunCount?.toLong() ?: 0
                 } else 0
             },
-            recoveries = synchronized(this) { recoveries },
+            recoveries = synchronized(playbackStateLock) { recoveries },
             lastPresentedTimestampMilliseconds = lastPresentedTimestampMilliseconds,
             targetBufferMilliseconds = TARGET_BUFFER_MILLISECONDS,
         )
@@ -582,6 +612,7 @@ class FireTVMediaPlayer(
         audioSampleRate = 0
         audioChannels = 0
         audioEncoding = 0
+        audioStreamFormat = null
         audioFramesWritten = 0
         firstAudioTimestampMilliseconds = null
     }

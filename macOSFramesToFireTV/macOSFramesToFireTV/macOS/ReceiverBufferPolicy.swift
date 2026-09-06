@@ -1,6 +1,6 @@
-/// Receiver buffers are relative to that receiver's latency target. Fire TV
-/// targets 180 ms; iOS targets 750 ms. Applying the iOS thresholds to Fire TV
-/// makes healthy playback repeatedly restart capture as quality is reduced.
+/// Receiver buffers are relative to that receiver's latency target. Current
+/// cinema receivers target 750 ms; older Fire TV builds target 180 ms.
+/// Intentional pre-roll must not trigger a capture restart/quality reduction.
 nonisolated enum ReceiverBufferPolicy {
     enum Health { case starved, low, healthy, neutral }
 
@@ -12,13 +12,20 @@ nonisolated enum ReceiverBufferPolicy {
         // A still desktop can legitimately have no queued video. Actual audio
         // starvation, or new recovery events, is stronger evidence of trouble.
         let effectiveBuffer = video > 0 ? min(video, audio) : audio
+        // Audio-clocked video deliberately waits behind audio's pre-roll. That
+        // encoded video queue is NOT decoder congestion. Counting its entire
+        // duration caused bitrate reductions every two seconds, eventually a
+        // resolution change, ScreenCaptureKit restart, and an audible gap.
+        // Only video waiting beyond the queued audio is decoder pressure; allow
+        // a small margin for HDMI latency and non-atomic receiver reports.
+        let excessBacklog = max(0, backlog - max(0, audio))
         if effectiveBuffer < target / 4 && (newUnderruns || newRecoveries) {
             return .starved
         }
-        if effectiveBuffer < target / 2 || backlog > max(250, target) {
+        if effectiveBuffer < target / 2 || excessBacklog > max(250, target / 2) {
             return .low
         }
-        if effectiveBuffer >= target * 4 / 5 && backlog < max(100, target / 2) &&
+        if effectiveBuffer >= target * 4 / 5 && excessBacklog < max(100, target / 4) &&
             !newUnderruns && !newRecoveries {
             return .healthy
         }

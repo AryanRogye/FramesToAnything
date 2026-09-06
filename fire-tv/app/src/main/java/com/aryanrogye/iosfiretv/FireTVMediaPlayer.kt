@@ -15,7 +15,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
-/** Low-latency hardware playback with a bounded audio-clocked jitter buffer. */
+/** Continuous, audio-clocked playback with a bounded cinema jitter buffer. */
 class FireTVMediaPlayer(
     private val onReport: (CinemaPlaybackReport) -> Unit = {},
     private val onKeyFrameNeeded: (String, Long) -> Unit = { _, _ -> },
@@ -48,13 +48,17 @@ class FireTVMediaPlayer(
     @Volatile private var audioEncoding = 0
     private var waitingForKeyFrame = true
     private var audioFramesWritten = 0L
-    private var firstAudioTimestampMilliseconds: Long? = null
+    @Volatile private var firstAudioTimestampMilliseconds: Long? = null
     private var underruns = 0L
     private var recoveries = 0L
     @Volatile private var lastPresentedTimestampMilliseconds = 0L
     @Volatile private var lastReceivedVideoTimestampMilliseconds = 0L
     @Volatile private var firstPlayableVideoTimestampMilliseconds = 0L
     private var scheduledVideoFrames = 0L
+    // Owned by decoderLock. A dequeued buffer remains ours until its deadline
+    // is near; do not sleep under the lock or block incoming audio/configuration.
+    private var pendingVideoOutput: Pair<Int, Long>? = null
+    private var lastAudioArrivalNanoseconds = 0L
 
     private val outputInfo = MediaCodec.BufferInfo()
 
@@ -129,10 +133,13 @@ class FireTVMediaPlayer(
         }
 
         val frame = VideoFrame(data, timestampMilliseconds, keyFrame)
-        if (!clock.isStarted() && keyFrame) {
+        if (!clock.isStarted() && keyFrame && firstAudioTimestampMilliseconds == null) {
             // Until audio is ready, retain only the newest complete GOP. Video
             // can arrive seconds before the first audio packet after capture
             // startup; decoding that old prefix makes the stream feel delayed.
+            // Once audio pre-roll has begun, preserve that GOP: moving the
+            // video start on every keyframe would discard the pictures paired
+            // with already-buffered audio throughout the cinema pre-roll.
             videoQueue.clear()
             firstPlayableVideoTimestampMilliseconds = timestampMilliseconds
         } else if (firstPlayableVideoTimestampMilliseconds == 0L) {
@@ -183,7 +190,10 @@ class FireTVMediaPlayer(
             .setUsage(AudioAttributes.USAGE_MEDIA)
             .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
             .build()
-        val halfSecond = sampleRate * audioChannels * PCM_BYTES_PER_SAMPLE / 2
+        // Capacity must exceed the pre-roll target or blocking writes fill the
+        // stopped track before play() can ever be reached. Reserve one second
+        // for a 750 ms pre-roll; both streams still follow the same audio clock.
+        val trackCapacityBytes = sampleRate * audioChannels * PCM_BYTES_PER_SAMPLE
         val minimum = AudioTrack.getMinBufferSize(
             sampleRate,
             channelMask,
@@ -193,7 +203,7 @@ class FireTVMediaPlayer(
             .setAudioAttributes(attributes)
             .setAudioFormat(format)
             .setTransferMode(AudioTrack.MODE_STREAM)
-            .setBufferSizeInBytes(maxOf(minimum, halfSecond))
+            .setBufferSizeInBytes(maxOf(minimum, trackCapacityBytes))
         synchronized(audioLock) {
             audioTrack = builder.build()
             if (encoding == AUDIO_AAC_LC) {
@@ -226,6 +236,12 @@ class FireTVMediaPlayer(
 
     fun queueAudio(data: ByteArray, timestampMilliseconds: Long) {
         if (!running.get() || audioSampleRate <= 0) return
+        val now = System.nanoTime()
+        val arrivalGapMs = (now - lastAudioArrivalNanoseconds) / 1_000_000L
+        if (lastAudioArrivalNanoseconds != 0L && arrivalGapMs > 150L) {
+            Log.w(TAG, "Audio delivery gap=${arrivalGapMs}ms queued=${audioQueue.size} pts=$timestampMilliseconds")
+        }
+        lastAudioArrivalNanoseconds = now
         val packet = AudioPacket(data, timestampMilliseconds)
         if (!audioQueue.offerLast(packet)) {
             audioQueue.pollFirst()
@@ -349,30 +365,34 @@ class FireTVMediaPlayer(
 
     private fun drainVideoLocked(codec: MediaCodec) {
         while (true) {
-            val outputIndex = codec.dequeueOutputBuffer(outputInfo, 0)
-            when {
-                outputIndex >= 0 -> {
-                    val timestampMilliseconds = outputInfo.presentationTimeUs / 1_000
-                    val renderTime = clock.renderTimeNanoseconds(timestampMilliseconds)
-                    if (renderTime == null) {
-                        codec.releaseOutputBuffer(outputIndex, false)
-                    } else if (renderTime < System.nanoTime() - STALE_VIDEO_NANOSECONDS) {
-                        codec.releaseOutputBuffer(outputIndex, false)
+            pendingVideoOutput?.let { (index, timestampMilliseconds) ->
+                // Recompute each attempt: a device timestamp can be corrected
+                // while this frame waits. Never clamp a future deadline to now;
+                // that turns buffering into exactly the video-ahead regression.
+                val renderTime = clock.renderTimeNanoseconds(timestampMilliseconds)
+                when (VideoPresentationPolicy.action(renderTime, System.nanoTime())) {
+                    VideoPresentationPolicy.Action.HOLD -> return
+                    VideoPresentationPolicy.Action.DROP -> {
+                        codec.releaseOutputBuffer(index, false)
                         synchronized(playbackStateLock) { underruns += 1 }
-                    } else {
-                        codec.releaseOutputBuffer(outputIndex, renderTime)
+                    }
+                    VideoPresentationPolicy.Action.RENDER -> {
+                        codec.releaseOutputBuffer(index, requireNotNull(renderTime))
                         lastPresentedTimestampMilliseconds = timestampMilliseconds
                         scheduledVideoFrames += 1
                         if (scheduledVideoFrames == 1L || scheduledVideoFrames % 120L == 0L) {
-                            val audioNow = clock.currentMediaTimestampMilliseconds()
-                            Log.d(
-                                TAG,
-                                "A/V schedule frame=$scheduledVideoFrames " +
-                                    "videoMs=$timestampMilliseconds audioMs=$audioNow " +
-                                    "leadMs=${(renderTime - System.nanoTime()) / 1_000_000L}",
-                            )
+                            Log.d(TAG, "A/V schedule frame=$scheduledVideoFrames " +
+                                "videoMs=$timestampMilliseconds audioMs=${clock.currentMediaTimestampMilliseconds()} " +
+                                "leadMs=${(renderTime - System.nanoTime()) / 1_000_000L}")
                         }
                     }
+                }
+                pendingVideoOutput = null
+            }
+            val outputIndex = codec.dequeueOutputBuffer(outputInfo, 0)
+            when {
+                outputIndex >= 0 -> {
+                    pendingVideoOutput = outputIndex to outputInfo.presentationTimeUs / 1_000
                 }
                 outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED ->
                     Log.d(TAG, "decoder output format=${codec.outputFormat}")
@@ -544,7 +564,11 @@ class FireTVMediaPlayer(
         }
         Log.w(TAG, "Video recovery requested: $reason")
         videoQueue.clear()
-        synchronized(decoderLock) { runCatching { decoder?.flush() } }
+        synchronized(decoderLock) {
+            // flush invalidates every dequeued buffer, including our held one.
+            pendingVideoOutput = null
+            runCatching { decoder?.flush() }
+        }
         requestKeyFrame(reason)
     }
 
@@ -586,6 +610,7 @@ class FireTVMediaPlayer(
     }
 
     private fun releaseVideoLocked() {
+        pendingVideoOutput = null
         decoder?.let { codec ->
             runCatching { codec.stop() }
             runCatching { codec.release() }
@@ -654,7 +679,10 @@ class FireTVMediaPlayer(
         const val AUDIO_PCM_16 = 1
         const val AUDIO_AAC_LC = 2
         const val PCM_BYTES_PER_SAMPLE = 2
-        const val TARGET_BUFFER_MILLISECONDS = 180L
+        // Watching video values continuity over interactive mirroring latency.
+        // Give short high-motion delivery bursts more headroom than the former
+        // 180 ms pre-roll; actual underruns force clock reacquisition and stalls.
+        const val TARGET_BUFFER_MILLISECONDS = 750L
         const val STARTUP_SYNC_TOLERANCE_MILLISECONDS = 80L
         const val REPORT_INTERVAL_MILLISECONDS = 250L
         const val VIDEO_POLL_MILLISECONDS = 10L
@@ -662,7 +690,6 @@ class FireTVMediaPlayer(
         const val CODEC_DEQUEUE_MICROSECONDS = 10_000L
         const val MAX_VIDEO_FRAMES = 120
         const val MAX_AUDIO_PACKETS = 100
-        const val STALE_VIDEO_NANOSECONDS = 100_000_000L
         val START_CODE = byteArrayOf(0, 0, 0, 1)
     }
 }

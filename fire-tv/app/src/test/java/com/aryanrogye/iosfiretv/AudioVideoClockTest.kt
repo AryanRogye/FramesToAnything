@@ -261,6 +261,52 @@ class AudioVideoClockTest {
 
     private fun clock(time: FakeTime) = AudioVideoClock(monotonicNanoseconds = { time.now })
 
+    @Test
+    fun `ten minutes of burst video stays inside the audio submission window`() {
+        val time = FakeTime()
+        val origin = time.now
+        val source = object : AudioPositionSource {
+            override fun timestamp() = AudioPosition(playbackHeadPosition(), time.now)
+            override fun playbackHeadPosition() = (time.now - origin) * SAMPLE_RATE / 1_000_000_000L
+        }
+        val clock = clock(time)
+        clock.start(source, FIRST_MEDIA_MILLISECONDS, SAMPLE_RATE)
+        assertFalse(clock.isStarted())
+        time.advanceMilliseconds(100)
+        assertTrue(clock.isStarted())
+        val pending = ArrayDeque<Long>()
+        var nextVideoMs = FIRST_MEDIA_MILLISECONDS + 100
+        var submitted = 0
+        repeat(60_000) { tick ->
+            // Network/decode bursts provide hundreds of milliseconds of video
+            // at once, with an initial two-second burst from the failing trace.
+            val elapsedMs = (time.now - origin) / NANOS_PER_MILLISECOND
+            if (tick % 40 == 0) {
+                val availableUntil = FIRST_MEDIA_MILLISECONDS + elapsedMs +
+                    if (tick == 0) 2_000 else 750
+                while (nextVideoMs <= availableUntil) {
+                    pending.addLast(nextVideoMs)
+                    nextVideoMs += 17
+                }
+            }
+            while (pending.isNotEmpty()) {
+                val deadline = clock.renderTimeNanoseconds(pending.first())
+                when (VideoPresentationPolicy.action(deadline, time.now)) {
+                    VideoPresentationPolicy.Action.HOLD -> break
+                    VideoPresentationPolicy.Action.DROP -> error("Continuous audio must not lose burst frames")
+                    VideoPresentationPolicy.Action.RENDER -> {
+                        assertTrue(requireNotNull(deadline) <= time.now + 30 * NANOS_PER_MILLISECOND)
+                        assertTrue(deadline >= time.now - 10 * NANOS_PER_MILLISECOND)
+                        pending.removeFirst()
+                        submitted += 1
+                    }
+                }
+            }
+            time.advanceMilliseconds(10)
+        }
+        assertTrue(submitted > 35_000)
+    }
+
     private class FakeTime(var now: Long = 10 * NANOS_PER_MILLISECOND) {
         fun advanceMilliseconds(milliseconds: Long) {
             now += milliseconds * NANOS_PER_MILLISECOND

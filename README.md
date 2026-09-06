@@ -114,7 +114,7 @@ The Kotlin Fire TV / Android TV receiver:
 - Decrypts media using AES-GCM.
 - Decodes H.264 with Android `MediaCodec` onto a `Surface`.
 - Negotiates PCM audio so timestamps do not include unreported AAC priming delay.
-- Uses a 180 ms startup buffer and timestamped `SurfaceView`
+- Uses a 750 ms startup buffer and timestamped `SurfaceView`
   presentation to avoid partial-frame updates and decoder corruption.
 - For negotiated Mac sessions, routes the Fire TV remote's play/pause button
   to the Mac system media key so browser video responds normally.
@@ -195,14 +195,24 @@ cd fire-tv
 The gate runs deterministic clock regression tests and builds both debug and
 release APKs. The tests cover delayed HDMI startup, invalid Fire OS timestamps,
 clock discontinuities, stalled audio, jitter, long playback, counter wrapping,
-and reset behavior. The GitHub workflow is named `Fire TV playback safety`; make
+reset behavior, and the video submission window. The latter reproduces a device
+trace with video scheduled 1,921 ms early: SurfaceView may ignore timestamps
+over about one second ahead, so decoded frames must remain application-owned
+until within 30 ms of their audio-clock deadline. They must be reconsidered
+against the current clock after a hold, and invalidated on codec flush/release.
+The GitHub workflow is named `Fire TV playback safety`; make
 its `A/V sync contract and APK builds` check required in the `main` branch
 protection rules so a failing or skipped result cannot be merged.
 
 Test the Mac's buffer policy too: `swift test --package-path macOSFramesToFireTV`.
 CI runs it on every PR to main, including sender-only changes. The sender uses
 the receiver's `targetBufferMs` report field (750 ms for older receivers that
-omit it) so a healthy 180 ms Fire TV buffer does not trigger capture restarts.
+omit it) so normal pre-roll is not misclassified using a different receiver's
+latency target. Tests retain coverage for older 180 ms Fire TV builds.
+Decoder pressure also excludes video intentionally waiting behind queued audio:
+the raw video queue duration includes cinema pre-roll and must not itself
+trigger a resolution/capture restart. Genuine excess backlog and audio
+starvation remain downgrade signals.
 
 Fire TV currently negotiates 16-bit PCM because the AAC wire format does not
 carry encoder priming/trim metadata. At 48 kHz stereo this uses about 1.54 Mbps
@@ -211,10 +221,18 @@ repeated identical H.264 configuration packets preserve the existing decoder.
 
 These checks verify software timing rules; they do not measure sound reaching
 the listener. Before releasing playback changes, run a paired Mac-to-Fire TV
-lip-sync clip through cold start, at least two minutes of playback, pause/resume,
-and reconnect. Check for blackouts and persistent audio lead/lag as well as
-`FireTVMedia` clock-gap/recovery logs. A successful APK launch alone is not a
+lip-sync clip through cold start, at least ten minutes of playback, pause/resume,
+and reconnect. Include high-motion scenes and replay the same scene before and
+after a change; a quiet desktop is not a congestion test. Check for blackouts,
+stutter and persistent audio lead/lag as well as `FireTVMedia` delivery-gap,
+clock-gap/recovery logs and AudioTrack underrun counts. Submission `leadMs`
+must never exceed 30 ms, even when incoming video is seconds ahead of audio.
+A successful APK launch alone is not a
 playback synchronization test.
+
+The clock/presentation test also simulates ten minutes of burst-delivered video
+using the production clock and submission policy. This is deterministic fake
+time, not a substitute for the ten-minute physical playback check above.
 
 ## Media pipeline
 
@@ -222,8 +240,12 @@ playback synchronization test.
 
 Mac-to-receiver sessions default to a playback-first pipeline:
 
-- iOS accumulates about 750 ms before starting; Fire TV buffers 180 ms of audio
+- iOS accumulates about 750 ms before starting; Fire TV buffers 750 ms of audio
   and waits for an advancing playback position before presenting video.
+  Fire TV's one-second AudioTrack capacity exceeds this pre-roll so startup
+  cannot block on a full, stopped track. This deliberately favors watching
+  continuity over minimum interactive mirroring latency; it does not guarantee
+  uninterrupted playback across sustained network/capture outages.
 - Audio is the playback clock; video presentation timestamps are scheduled
   against that clock instead of being displayed immediately on arrival.
 - Sender and receiver queues preserve H.264 dependency order under normal

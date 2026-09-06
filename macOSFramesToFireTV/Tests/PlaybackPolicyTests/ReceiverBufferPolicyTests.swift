@@ -25,6 +25,31 @@ final class ReceiverBufferPolicyTests: XCTestCase {
         XCTAssertEqual(classify(video: 180, audio: 180, target: 750), .low)
     }
 
+    func testCinemaPrerollIsNotDecoderCongestion() {
+        // Held video plus HDMI's output latency is normal, not a reason to
+        // restart screen/audio capture at a lower resolution every two seconds.
+        for backlog in [650, 750, 900] {
+            XCTAssertEqual(ReceiverBufferPolicy.classify(
+                video: 950, audio: 750, backlog: backlog, target: 750,
+                newUnderruns: false, newRecoveries: false
+            ), .healthy)
+        }
+    }
+
+    func testDecoderFallingBehindAudioStillReducesQuality() {
+        XCTAssertEqual(ReceiverBufferPolicy.classify(
+            video: 1_800, audio: 750, backlog: 1_500, target: 750,
+            newUnderruns: false, newRecoveries: false
+        ), .low)
+    }
+
+    func testEmptyAudioIsNotHiddenByLargeVideoPreroll() {
+        XCTAssertEqual(ReceiverBufferPolicy.classify(
+            video: 1_800, audio: 0, backlog: 1_500, target: 750,
+            newUnderruns: true, newRecoveries: false
+        ), .starved)
+    }
+
     private func classify(
         video: Int, audio: Int, target: Int = 180, underrun: Bool = false
     ) -> ReceiverBufferPolicy.Health {

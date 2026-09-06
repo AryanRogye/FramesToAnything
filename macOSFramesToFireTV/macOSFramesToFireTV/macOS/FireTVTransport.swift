@@ -537,8 +537,8 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
         let underruns = object["underruns"] as? Int ?? lastUnderruns
         let recoveries = object["recoveries"] as? Int ?? lastRecoveries
         // Older receivers omit the target and used the original 750 ms buffer.
-        // New Fire TV reports its 180 ms target so healthy low latency playback
-        // does not trigger a resolution change and stop/start ScreenCaptureKit.
+        // Respect the negotiated receiver target (including older 180 ms Fire
+        // TV builds) instead of mistaking intentional pre-roll for starvation.
         let health = ReceiverBufferPolicy.classify(
             video: videoBuffer, audio: audioBuffer, backlog: decoderBacklog,
             target: object["targetBufferMs"] as? Int ?? 750,
@@ -595,6 +595,7 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
     private func applyCurrentQuality(force: Bool = false) {
         guard qualityLadder.indices.contains(qualityLevelIndex) else { return }
         let level = qualityLadder[qualityLevelIndex]
+        macTransportLogger.info("Adaptive quality index=\(self.qualityLevelIndex) bitrate=\(level.averageBitRate)")
         mediaEncoder.updateConfiguration(
             .init(
                 framesPerSecond: 60,
@@ -693,6 +694,7 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
                 }
                 if pendingPackets.lazy.filter({ $0.kind == .video }).count >= Self.maximumPendingVideoPackets ||
                     pendingPackets.reduce(0, { $0 + $1.data.count }) + packet.count > Self.maximumPendingBytes {
+                    macTransportLogger.warning("Video send queue overflow packets=\(self.pendingPackets.count) incomingBytes=\(packet.count)")
                     pendingPackets.removeAll { $0.kind == .video }
                     waitingForCleanVideoFrame = true
                     mediaEncoder.stop()
@@ -705,6 +707,7 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
                 )
             case .audio:
                 if pendingPackets.lazy.filter({ $0.kind == .audio }).count >= Self.maximumPendingAudioPackets {
+                    macTransportLogger.warning("Audio send queue overflow packets=\(self.pendingPackets.count)")
                     pendingPackets.removeAll { $0.kind == .audio || $0.kind == .video }
                     waitingForCleanVideoFrame = true
                     mediaEncoder.stop()

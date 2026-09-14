@@ -5,6 +5,7 @@ import PackageDescription
 // cannot hide another mismatch across the Mac/Fire TV protocol boundary.
 let package = Package(
     name: "PlaybackPolicy",
+    platforms: [.macOS(.v15)],
     products: [.library(name: "PlaybackPolicy", targets: ["PlaybackPolicy"])],
     targets: [
         .target(

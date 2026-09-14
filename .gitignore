@@ -7,3 +7,4 @@ fire-tv/build/
 fire-tv/app/build/
 fire-tv/local.properties
 macOSFramesToFireTV/.build/
+iOSFramesReceiver/.build/

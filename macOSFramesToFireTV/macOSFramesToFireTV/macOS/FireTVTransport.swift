@@ -105,6 +105,7 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
     private var rememberedSecret: Data?
     private var usedRememberedSecret = false
     private var serverChallenge: Data?
+    private var lastControlSequence: UInt64 = 0
     private var clientChallenge: Data?
     private var handshakeKey: SymmetricKey?
     private var streamingKey: SymmetricKey?
@@ -389,9 +390,23 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
     }
 
     private func handleJSON(_ bytes: Data.SubSequence) {
-        guard let object = try? JSONSerialization.jsonObject(with: Data(bytes)) as? [String: Any],
-              let type = object["type"] as? String else {
+        guard var object = try? JSONSerialization.jsonObject(with: Data(bytes)) as? [String: Any],
+              var type = object["type"] as? String else {
             fail("The Fire TV sent an unreadable authentication message.")
+            return
+        }
+        if let key = currentStreamingKey() {
+            // Session authentication alone does not authenticate a control.
+            // Ignore unsigned records (including replayed handshakes).
+            guard receiverFeatures.contains(ReceiverControlAuthentication.feature),
+                  let serverChallenge, let clientChallenge,
+                  let verified = ReceiverControlAuthentication.verify(
+                    object, key: key, server: serverChallenge, client: clientChallenge,
+                    lastSequence: &lastControlSequence
+                  ), let verifiedType = verified["type"] as? String else { return }
+            object = verified
+            type = verifiedType
+        } else if !["hello", "auth_ok", "auth_failed"].contains(type) {
             return
         }
         switch type {
@@ -506,7 +521,8 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
                 fail("That pairing code was not accepted. The receiver has generated a new code.")
             }
         case "request_keyframe":
-            guard currentStreamingKey() != nil else { return }
+            guard currentStreamingKey() != nil,
+                  receiverFeatures.contains("keyframe-request-v1") else { return }
             macTransportLogger.info("Receiver requested a clean H.264 keyframe")
             mediaEncoder.stop()
             mediaEncoder.restart()
@@ -768,6 +784,7 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
     }
 
     private func clearHandshakeState() {
+        lastControlSequence = 0
         receiveBuffer.removeAll(keepingCapacity: true)
         serverChallenge = nil
         clientChallenge = nil
@@ -934,6 +951,7 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
     private static let aacFeature = "aac-lc-v1"
     private static let remoteMediaControlsFeature = "remote-media-controls-v1"
     private static let cinemaFeatures: Set<String> = [
+        ReceiverControlAuthentication.feature,
         "cinema-buffer-v1",
         receiverReportsFeature,
         "keyframe-request-v1",

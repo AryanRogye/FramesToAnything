@@ -67,6 +67,7 @@ class PairingServer(
     private var serverSocket: ServerSocket? = null
     @Volatile
     private var activeOutput: DataOutputStream? = null
+    private var controlAuthentication: ReceiverControlAuthentication? = null
     @Volatile
     private var negotiatedFeatures: Set<String> = emptySet()
     private val outputLock = Any()
@@ -138,6 +139,7 @@ class PairingServer(
                             .put(FEATURE_CINEMA_BUFFER)
                             .put(FEATURE_RECEIVER_REPORTS)
                             .put(FEATURE_KEYFRAME_REQUEST)
+                            .put(ReceiverControlAuthentication.FEATURE)
                             // Raw AAC in this protocol carries no encoder-delay
                             // or trim metadata. The Mac assigns input PCM PTS to
                             // primed AAC output, so decoded sound can lag video
@@ -232,7 +234,10 @@ class PairingServer(
             )
 
             socket.soTimeout = 0
-            activeOutput = output
+            synchronized(outputLock) {
+                controlAuthentication = ReceiverControlAuthentication(key, serverChallenge, clientChallenge)
+                activeOutput = output
+            }
             Log.i(TAG, "authentication succeeded for ${deviceName ?: "unknown device"}")
             listener.onStatus("Streaming display and audio", true)
             readMedia(input, key)
@@ -243,7 +248,12 @@ class PairingServer(
                 listener.onStatus("Connection ended: ${error.message ?: "unknown"}", false)
             }
         } finally {
-            if (activeOutput === output) activeOutput = null
+            synchronized(outputLock) {
+                if (activeOutput === output) {
+                    activeOutput = null
+                    controlAuthentication = null
+                }
+            }
             negotiatedFeatures = emptySet()
             listener.onMediaEnded()
             runCatching { socket.close() }
@@ -365,7 +375,7 @@ class PairingServer(
             .put("recoveries", report.recoveries)
             .put("lastPresentedTimestampMs", report.lastPresentedTimestampMilliseconds)
         synchronized(outputLock) {
-            runCatching { writeJson(output, message) }
+            runCatching { writeControl(output, message) }
         }
     }
 
@@ -378,7 +388,7 @@ class PairingServer(
             .put("reason", reason)
             .put("lastPresentedTimestampMs", lastPresentedTimestampMilliseconds)
         synchronized(outputLock) {
-            runCatching { writeJson(output, message) }
+            runCatching { writeControl(output, message) }
         }
     }
 
@@ -391,8 +401,21 @@ class PairingServer(
             .put("version", 1)
             .put("command", command)
         synchronized(outputLock) {
-            runCatching { writeJson(output, message) }
+            runCatching { writeControl(output, message) }
         }
+    }
+
+    private fun writeControl(output: DataOutputStream, message: JSONObject) {
+        if (activeOutput !== output ||
+            !negotiatedFeatures.contains(ReceiverControlAuthentication.FEATURE)) return
+        val signer = controlAuthentication ?: return
+        val payload = message.toString().toByteArray(StandardCharsets.UTF_8)
+        val (sequence, proof) = signer.next(payload)
+        writeJson(output, JSONObject()
+            .put("type", "authenticated_control")
+            .put("sequence", sequence.toString())
+            .put("payload", encode(payload))
+            .put("proof", encode(proof)))
     }
 
     private fun discoverMacSender() {
@@ -635,6 +658,7 @@ class PairingServer(
         const val FEATURE_REMOTE_MEDIA_CONTROLS = "remote-media-controls-v1"
         const val REMOTE_COMMAND_TOGGLE_PLAY_PAUSE = "toggle_play_pause"
         val SUPPORTED_FEATURES = setOf(
+            ReceiverControlAuthentication.FEATURE,
             FEATURE_CINEMA_BUFFER,
             FEATURE_RECEIVER_REPORTS,
             FEATURE_KEYFRAME_REQUEST,

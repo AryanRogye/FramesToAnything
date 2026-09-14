@@ -59,6 +59,8 @@ nonisolated final class PairingService: @unchecked Sendable {
     private var salt: Data?
     private var serverChallenge: Data?
     private var sessionKey: SymmetricKey?
+    private var controlClientChallenge: Data?
+    private var controlSequence: UInt64 = 0
     private var authenticated = false
     private var negotiatedFeatures = Set<String>()
 
@@ -393,6 +395,7 @@ nonisolated final class PairingService: @unchecked Sendable {
         // Install the key before sending auth_ok. If the Mac responds with its
         // first media record immediately, the record can be processed safely.
         sessionKey = key
+        controlClientChallenge = clientChallenge
         authenticated = true
         sendJSON(
             [
@@ -494,7 +497,7 @@ nonisolated final class PairingService: @unchecked Sendable {
                   authenticated,
                   negotiatedFeatures.contains("receiver-report-v1"),
                   let connection else { return }
-            sendJSON(
+            sendControl(
                 [
                     "type": "receiver_report",
                     "version": 1,
@@ -516,7 +519,7 @@ nonisolated final class PairingService: @unchecked Sendable {
                   authenticated,
                   negotiatedFeatures.contains("keyframe-request-v1"),
                   let connection else { return }
-            sendJSON(
+            sendControl(
                 [
                     "type": "request_keyframe",
                     "version": 1,
@@ -526,6 +529,18 @@ nonisolated final class PairingService: @unchecked Sendable {
                 on: connection
             )
         }
+    }
+
+    private func sendControl(_ object: [String: Any], on connection: NWConnection) {
+        guard authenticated, negotiatedFeatures.contains(ReceiverControlAuthentication.feature),
+              let sessionKey, let serverChallenge, let controlClientChallenge,
+              controlSequence < UInt64.max,
+              let payload = try? JSONSerialization.data(withJSONObject: object) else { return }
+        controlSequence += 1
+        sendJSON(ReceiverControlAuthentication.envelope(
+            key: sessionKey, server: serverChallenge, client: controlClientChallenge,
+            sequence: controlSequence, payload: payload
+        ), on: connection)
     }
 
     private func sendJSON(
@@ -586,6 +601,8 @@ nonisolated final class PairingService: @unchecked Sendable {
     }
 
     private func clearSession() {
+        controlClientChallenge = nil
+        controlSequence = 0
         receiveBuffer.removeAll(keepingCapacity: true)
         salt = nil
         serverChallenge = nil
@@ -819,10 +836,11 @@ nonisolated final class PairingService: @unchecked Sendable {
     private static let maximumJSONPacketBytes: UInt32 = 64 * 1024
     private static let maximumFramePacketBytes: UInt32 = 8 * 1024 * 1024
     private static let cinemaFeatures: Set<String> = [
+        ReceiverControlAuthentication.feature,
         "cinema-buffer-v1",
         "receiver-report-v1",
         "keyframe-request-v1",
-        "aac-lc-v1",
+        // AAC has no encoder-delay/trim metadata yet. PCM preserves source PTS.
     ]
 }
 

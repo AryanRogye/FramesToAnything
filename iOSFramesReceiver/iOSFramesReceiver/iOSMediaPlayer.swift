@@ -53,6 +53,9 @@ final class iOSMediaPlayer {
     private var audioBytesPerFrame = 0
     private var audioScheduledFrames: AVAudioFramePosition = 0
     private var audioCompletedFrames: AVAudioFramePosition = 0
+    private var audioGeneration: UInt64 = 0
+    private var playbackStartHostSeconds: Double = 0
+    private var audioClockProgress = AudioClockProgress()
     private var audioFirstTimestampMilliseconds: Int64?
     private var latestAudioTimestampMilliseconds: Int64 = 0
 
@@ -154,6 +157,7 @@ final class iOSMediaPlayer {
         if audioEngine.isRunning {
             audioEngine.stop()
         }
+        audioGeneration &+= 1
         audioNode.stop()
         audioScheduledFrames = 0
         audioCompletedFrames = 0
@@ -333,16 +337,39 @@ final class iOSMediaPlayer {
         timestampMilliseconds: Int64
     ) {
         let frameCount = Int(buffer.frameLength)
+        guard frameCount > 0 else { return }
+        // Detect starvation before appending: player sample time can continue
+        // through silence, so simply appending would hide the discontinuity.
+        if playbackStarted { reconcileAudioClock() }
+        if let origin = audioFirstTimestampMilliseconds,
+           AudioTimelinePolicy.isDiscontinuous(
+            origin: origin, scheduledFrames: audioScheduledFrames,
+            sampleRate: audioSampleRate, incomingTimestamp: timestampMilliseconds
+           ) {
+            rebufferAudioAndVideo(reason: "audio_timestamp_discontinuity")
+        }
+        if AudioTimelinePolicy.exceedsBound(
+            queuedFrames: audioScheduledFrames - audioCompletedFrames,
+            incomingFrames: Int64(frameCount), sampleRate: audioSampleRate
+        ) {
+            rebufferAudioAndVideo(reason: "audio_queue_bound")
+        }
+        // A single oversized packet must not bypass the bound after reset.
+        guard !AudioTimelinePolicy.exceedsBound(
+            queuedFrames: 0, incomingFrames: Int64(frameCount), sampleRate: audioSampleRate
+        ) else { return }
         audioFirstTimestampMilliseconds = audioFirstTimestampMilliseconds ?? timestampMilliseconds
         latestAudioTimestampMilliseconds = max(
             latestAudioTimestampMilliseconds,
             timestampMilliseconds + milliseconds(forFrames: frameCount)
         )
         audioScheduledFrames += AVAudioFramePosition(frameCount)
+        let generation = audioGeneration
 
         audioNode.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.audioCompletedFrames += AVAudioFramePosition(frameCount)
+                guard let self, audioGeneration == generation else { return }
+                audioCompletedFrames += AVAudioFramePosition(frameCount)
             }
         }
         maybeStartPlayback()
@@ -367,6 +394,7 @@ final class iOSMediaPlayer {
     }
 
     func reset() {
+        audioGeneration &+= 1
         reportTimer?.invalidate()
         reportTimer = nil
         playbackStarted = false
@@ -419,12 +447,14 @@ final class iOSMediaPlayer {
         CMTimebaseSetTime(
             playbackTimebase,
             time: CMTime(
-                value: audioOrigin - Int64(leadTimeSeconds * 1_000),
+                value: audioOrigin - Int64((leadTimeSeconds + audioNode.outputPresentationLatency) * 1_000),
                 timescale: 1_000
             )
         )
         CMTimebaseSetRate(playbackTimebase, rate: 1)
         playbackStarted = true
+        audioClockProgress = AudioClockProgress()
+        playbackStartHostSeconds = AVAudioTime.seconds(forHostTime: mach_absolute_time()) + leadTimeSeconds
         audioNode.play(at: AVAudioTime(hostTime: mach_absolute_time() + AVAudioTime.hostTime(forSeconds: leadTimeSeconds)))
 
         let buffered = pendingVideo
@@ -498,6 +528,8 @@ final class iOSMediaPlayer {
 
     private func sendPlaybackReport() {
         guard playbackStarted else { return }
+        reconcileAudioClock()
+        guard playbackStarted else { return }
         let currentTimestamp = currentSourceTimestampMilliseconds()
         let videoBuffer = max(0, Int(latestVideoTimestampMilliseconds - currentTimestamp))
         let audioBuffer = max(0, Int(latestAudioTimestampMilliseconds - currentTimestamp))
@@ -529,6 +561,71 @@ final class iOSMediaPlayer {
                 )
             )
         )
+    }
+
+    private func rebufferAudioAndVideo(reason: String) {
+        audioGeneration &+= 1
+        audioNode.stop()
+        audioDecoder?.reset()
+        audioScheduledFrames = 0
+        audioCompletedFrames = 0
+        audioFirstTimestampMilliseconds = nil
+        latestAudioTimestampMilliseconds = 0
+        playbackStarted = false
+        sourcePlaybackOriginMilliseconds = nil
+        CMTimebaseSetRate(playbackTimebase, rate: 0)
+        reportTimer?.invalidate()
+        reportTimer = nil
+        firstVideoTimestampMilliseconds = nil
+        latestVideoTimestampMilliseconds = 0
+        waitingForKeyFrame = true
+        pendingVideo.removeAll(keepingCapacity: true)
+        groupOfPictures.removeAll(keepingCapacity: true)
+        wasAudioBufferLow = false
+        recoveryCount += 1
+        for identifier in layerStates.keys {
+            layerStates[identifier]?.pendingSamples.removeAll(keepingCapacity: true)
+            layerStates[identifier]?.layer?.flushAndRemoveImage()
+        }
+        onKeyFrameNeeded?(reason, lastPresentedTimestampMilliseconds)
+    }
+
+    private func reconcileAudioClock() {
+        guard playbackStarted, let origin = audioFirstTimestampMilliseconds else { return }
+        let now = AVAudioTime.seconds(forHostTime: mach_absolute_time())
+        guard now >= playbackStartHostSeconds else { return }
+        guard audioEngine.isRunning, audioNode.isPlaying,
+              let render = audioNode.lastRenderTime, render.isHostTimeValid,
+              let player = audioNode.playerTime(forNodeTime: render),
+              player.isSampleTimeValid, player.sampleRate > 0 else {
+            if now - playbackStartHostSeconds > 0.5 {
+                rebufferAudioAndVideo(reason: "audio_clock_unavailable")
+            }
+            return
+        }
+        let age = max(0, now - AVAudioTime.seconds(forHostTime: render.hostTime))
+        let renderedSeconds = Double(player.sampleTime) / player.sampleRate
+        if audioClockProgress.isStalled(position: renderedSeconds, now: now) {
+            rebufferAudioAndVideo(reason: "audio_clock_stalled")
+            return
+        }
+        let scheduledSeconds = Double(audioScheduledFrames) / Double(audioSampleRate)
+        // The node's render position precedes physical output by the downstream
+        // presentation latency. Anchor video to the audible source position.
+        switch AudioTimelinePolicy.clockDecision(
+            originSeconds: Double(origin) / 1_000, renderedSeconds: renderedSeconds,
+            renderAge: age, scheduledSeconds: scheduledSeconds,
+            outputLatency: audioNode.outputPresentationLatency,
+            videoSeconds: CMTimeGetSeconds(CMTimebaseGetTime(playbackTimebase))
+        ) {
+        case .keep:
+            break
+        case .rebuffer:
+            underrunCount += 1
+            rebufferAudioAndVideo(reason: "audio_clock_discontinuity")
+        case .anchor(let audible):
+            CMTimebaseSetTime(playbackTimebase, time: CMTime(seconds: audible, preferredTimescale: 1_000_000))
+        }
     }
 
     private func currentSourceTimestampMilliseconds() -> Int64 {

@@ -22,6 +22,8 @@ class FireTVMediaPlayer(
 ) {
     private val running = AtomicBoolean(true)
     private val decoderLock = Any()
+    // Guarded by decoderLock; never reset while old workers may retain input.
+    private val decoderGeneration = DecoderGeneration()
     private val audioLock = Any()
     // Decoder callbacks must never acquire the player lifecycle monitor (`this`).
     // configureVideo/reset hold that monitor while acquiring decoderLock; taking
@@ -109,49 +111,58 @@ class FireTVMediaPlayer(
             sps.copyOf(),
             pps.copyOf(),
         )
-        videoQueue.clear()
-        waitingForKeyFrame = true
-        startVideoDecoder()
+        synchronized(decoderLock) {
+            videoQueue.clear()
+            waitingForKeyFrame = true
+            startVideoDecoder()
+        }
     }
 
     /** SurfaceView surfaces support timestamped presentation at VSYNC. */
     @Synchronized
     fun setSurface(newSurface: Surface?) {
-        synchronized(decoderLock) { releaseVideoLocked() }
-        surface = newSurface
-        waitingForKeyFrame = true
-        videoConfiguration?.let { startVideoDecoder() }
+        synchronized(decoderLock) {
+            releaseVideoLocked()
+            surface = newSurface
+            waitingForKeyFrame = true
+            videoConfiguration?.let { startVideoDecoder() }
+        }
         if (newSurface != null) requestKeyFrame("surface_changed")
     }
 
     fun queueVideo(data: ByteArray, timestampMilliseconds: Long, keyFrame: Boolean) {
-        if (!running.get()) return
-        lastReceivedVideoTimestampMilliseconds = timestampMilliseconds
-        synchronized(playbackStateLock) {
-            if (waitingForKeyFrame && !keyFrame) return
-            if (keyFrame) waitingForKeyFrame = false
-        }
+        var requestRecovery = false
+        synchronized(decoderLock) {
+            if (!running.get()) return
+            lastReceivedVideoTimestampMilliseconds = timestampMilliseconds
+            synchronized(playbackStateLock) {
+                if (waitingForKeyFrame && !keyFrame) return
+                if (keyFrame) waitingForKeyFrame = false
+            }
 
-        val frame = VideoFrame(data, timestampMilliseconds, keyFrame)
-        if (!clock.isStarted() && keyFrame && firstAudioTimestampMilliseconds == null) {
-            // Until audio is ready, retain only the newest complete GOP. Video
-            // can arrive seconds before the first audio packet after capture
-            // startup; decoding that old prefix makes the stream feel delayed.
-            // Once audio pre-roll has begun, preserve that GOP: moving the
-            // video start on every keyframe would discard the pictures paired
-            // with already-buffered audio throughout the cinema pre-roll.
-            videoQueue.clear()
-            firstPlayableVideoTimestampMilliseconds = timestampMilliseconds
-        } else if (firstPlayableVideoTimestampMilliseconds == 0L) {
-            firstPlayableVideoTimestampMilliseconds = timestampMilliseconds
-        }
-        if (!videoQueue.offerLast(frame)) {
-            enterRecovery("video_queue_overflow")
-            if (keyFrame) {
-                synchronized(playbackStateLock) { waitingForKeyFrame = false }
-                videoQueue.offerLast(frame)
+            val frame = VideoFrame(data, timestampMilliseconds, keyFrame, decoderGeneration.current)
+            if (!clock.isStarted() && keyFrame && firstAudioTimestampMilliseconds == null) {
+                // Until audio is ready, retain only the newest complete GOP. Video
+                // can arrive seconds before the first audio packet after capture
+                // startup; decoding that old prefix makes the stream feel delayed.
+                // Once audio pre-roll has begun, preserve that GOP: moving the
+                // video start on every keyframe would discard the pictures paired
+                // with already-buffered audio throughout the cinema pre-roll.
+                videoQueue.clear()
+                firstPlayableVideoTimestampMilliseconds = timestampMilliseconds
+            } else if (firstPlayableVideoTimestampMilliseconds == 0L) {
+                firstPlayableVideoTimestampMilliseconds = timestampMilliseconds
+            }
+            if (!videoQueue.offerLast(frame)) {
+                requestRecovery = beginRecoveryLocked("video_queue_overflow")
+                if (keyFrame) {
+                    synchronized(playbackStateLock) { waitingForKeyFrame = false }
+                    videoQueue.offerLast(frame.copy(generation = decoderGeneration.current))
+                }
             }
         }
+        // Network writes must not extend the decoder critical section.
+        if (requestRecovery) requestKeyFrame("video_queue_overflow")
     }
 
     @Synchronized
@@ -324,6 +335,7 @@ class FireTVMediaPlayer(
     private fun feedVideo(frame: VideoFrame) {
         while (running.get()) {
             val accepted = synchronized(decoderLock) {
+                if (!decoderGeneration.accepts(frame.generation)) return
                 val codec = decoder ?: return
                 // Output buffers can hold all decoder resources while waiting
                 // for the Surface. Drain them before asking for input space;
@@ -554,22 +566,26 @@ class FireTVMediaPlayer(
     }
 
     private fun enterRecovery(reason: String) {
+        val requested = synchronized(decoderLock) { beginRecoveryLocked(reason) }
+        if (requested) requestKeyFrame(reason)
+    }
+
+    private fun beginRecoveryLocked(reason: String): Boolean {
         synchronized(playbackStateLock) {
             // Many packets can hit a full queue before the requested keyframe
             // returns. One outstanding recovery is enough; repeated requests
             // restart both encoders and prevent either pipeline from settling.
-            if (waitingForKeyFrame) return
+            if (waitingForKeyFrame) return false
             waitingForKeyFrame = true
             recoveries += 1
         }
         Log.w(TAG, "Video recovery requested: $reason")
         videoQueue.clear()
-        synchronized(decoderLock) {
-            // flush invalidates every dequeued buffer, including our held one.
-            pendingVideoOutput = null
-            runCatching { decoder?.flush() }
-        }
-        requestKeyFrame(reason)
+        // Flush invalidates both held output and input retained across retries.
+        decoderGeneration.invalidate()
+        pendingVideoOutput = null
+        runCatching { decoder?.flush() }
+        return true
     }
 
     private fun requestKeyFrame(reason: String) {
@@ -610,6 +626,7 @@ class FireTVMediaPlayer(
     }
 
     private fun releaseVideoLocked() {
+        decoderGeneration.invalidate()
         pendingVideoOutput = null
         decoder?.let { codec ->
             runCatching { codec.stop() }
@@ -659,6 +676,7 @@ class FireTVMediaPlayer(
         val data: ByteArray,
         val timestampMilliseconds: Long,
         val keyFrame: Boolean,
+        val generation: Long,
     )
 
     private data class AudioPacket(

@@ -96,8 +96,9 @@ The iPhone/iPad version:
 - Connects to the Mac and performs the same authenticated handshake as the Fire TV receiver.
 - Parses and decrypts framed AES-GCM media records.
 - Converts Annex-B H.264 access units for `AVSampleBufferDisplayLayer` hardware playback.
-- Prefers AAC-LC audio and retains interleaved 16-bit PCM as a negotiated fallback.
-- Buffers about 750 ms and presents H.264 frames against the audio/host clock.
+- Negotiates interleaved 16-bit PCM until AAC encoder-delay/trim metadata exists.
+- Buffers about 750 ms and reconciles video against measured audio playback, including output latency.
+- Caps queued audio at three seconds and restarts both timelines on audio gaps or starvation.
 - Provides an embedded preview and a distraction-free full-screen player.
 - Reconnects after interrupted sessions and offers a manual session reset.
 
@@ -205,6 +206,10 @@ its `A/V sync contract and APK builds` check required in the `main` branch
 protection rules so a failing or skipped result cannot be merged.
 
 Test the Mac's buffer policy too: `swift test --package-path macOSFramesToFireTV`.
+Test iOS audio bounds, clock decisions, and control authentication with
+`swift test --package-path iOSFramesReceiver`. Swift and Kotlin share an
+OpenSSL-checked control authentication vector; tests reject tampering,
+replays, and records from a different handshake.
 CI runs it on every PR to main, including sender-only changes. The sender uses
 the receiver's `targetBufferMs` report field (750 ms for older receivers that
 omit it) so normal pre-roll is not misclassified using a different receiver's
@@ -352,7 +357,8 @@ Media kinds:
 The maximum framed media record is 8 MiB. JSON handshake records are limited to 64 KiB.
 
 The handshake advertises optional `cinema-buffer-v1`, `receiver-report-v1`,
-`keyframe-request-v1`, `aac-lc-v1`, and `remote-media-controls-v1`
+`keyframe-request-v1`, `aac-lc-v1`, `remote-media-controls-v1`, and
+`authenticated-controls-v1`
 capabilities. Older peers continue to use the established PCM media path and
 receive no unnegotiated remote-control messages.
 
@@ -360,6 +366,23 @@ The first remote play/pause command may ask for macOS Accessibility permission.
 Grant it to the Mac sender so it can post the same system media-key event as a
 physical keyboard. Remote commands are accepted only from the currently
 authenticated receiver.
+
+### Authenticated receiver controls
+
+Updated receivers wrap reports, keyframe requests, and remote commands in a
+type-0 JSON envelope with `type: "authenticated_control"`, a positive decimal
+string `sequence`, base64 `payload` (the exact inner JSON bytes), and base64
+`proof`. The proof is HMAC-SHA256 using the session key over the concatenation:
+`UTF8("receiver-control-v1") || serverChallenge[32] || clientChallenge[32] ||
+sequence[8, big-endian] || payload`. Sequence numbers increase under the same
+serialization lock/queue as socket writes and reset for each handshake.
+The Mac verifies the tag and rejects non-increasing sequences before dispatch.
+Challenges prevent cross-handshake replay, including with a reused pairing key.
+
+Update the Mac and receiver together to retain reports, recovery requests, and
+remote pause. Mixed versions can still stream media, but updated peers never
+fall back to unsigned controls. Fire TV's PCM negotiation, audio clock, buffer
+target, and presentation policy are unchanged by this control protocol addition.
 
 ## Current limitations
 

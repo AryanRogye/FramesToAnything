@@ -11,7 +11,7 @@ let package = Package(
             name: "PlaybackPolicy",
             path: "macOSFramesToFireTV/macOS",
             exclude: ["FireTVTransport.swift", "macOSContentView.swift"],
-            sources: ["ReceiverBufferPolicy.swift"]
+            sources: ["ReceiverBufferPolicy.swift", "ReceiverControlAuthentication.swift"]
         ),
         .testTarget(name: "PlaybackPolicyTests", dependencies: ["PlaybackPolicy"])
     ]

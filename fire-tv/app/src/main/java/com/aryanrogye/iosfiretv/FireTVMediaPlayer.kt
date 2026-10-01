@@ -36,6 +36,8 @@ class FireTVMediaPlayer(
         onInfo = { Log.i(TAG, it) },
         onWarning = { Log.w(TAG, it) },
     )
+    fun captionMediaTimeMilliseconds(): Long? = clock.currentMediaTimestampMilliseconds()
+
     private val videoQueue = LinkedBlockingDeque<VideoFrame>(MAX_VIDEO_FRAMES)
     private val audioQueue = LinkedBlockingDeque<AudioPacket>(MAX_AUDIO_PACKETS)
 

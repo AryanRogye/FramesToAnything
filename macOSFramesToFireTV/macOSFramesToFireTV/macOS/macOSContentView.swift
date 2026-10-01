@@ -62,6 +62,14 @@ struct MacMenuBarContent: View {
             }
             .disabled(model.isStreaming)
 
+            Toggle("Live Captions", isOn: $model.captionsEnabled)
+
+            Picker("Caption Mode", selection: $model.selectedCaptionMode) {
+                ForEach(CaptionMode.allCases) { mode in
+                    Text(mode.label).tag(mode)
+                }
+            }
+
             if model.isStreaming {
                 Button("Stop Streaming", systemImage: "stop.fill", role: .destructive) {
                     model.stopStreaming()
@@ -178,6 +186,7 @@ struct MacPairingView: View {
 final class MacStreamingModel {
     private let transport = MacFireTVTransport()
     private let capture = ScreenRecordService()
+    private let captions = LiveCaptionExperiment()
 
     var devices: [MacFireTVDevice] = []
     var selectedDeviceID: String?
@@ -187,15 +196,40 @@ final class MacStreamingModel {
     var manualAddress = ""
     var pairingCode = ""
     var connectionState: MacFireTVConnectionState = .searching
+    var captionsEnabled = (UserDefaults.standard.object(forKey: "captions.enabled") as? Bool) ?? true {
+        didSet {
+            guard oldValue != captionsEnabled else { return }
+            UserDefaults.standard.set(captionsEnabled, forKey: "captions.enabled")
+            if captionsEnabled && isStreaming { captions.start(mode: selectedCaptionMode) }
+            if !captionsEnabled { captions.stop() }
+        }
+    }
+    var selectedCaptionMode = CaptionMode(
+        rawValue: UserDefaults.standard.string(forKey: "captions.mode") ?? ""
+    ) ?? .englishCaptions {
+        didSet {
+            guard oldValue != selectedCaptionMode else { return }
+            UserDefaults.standard.set(selectedCaptionMode.rawValue, forKey: "captions.mode")
+            captions.changeMode(selectedCaptionMode)
+        }
+    }
     var selectedQuality: MacStreamQuality = .fullHD
     private(set) var activeQuality: MacStreamQuality = .fullHD
     private(set) var activeBitRate = 10_000_000
-    var isStreaming = false
+    var isStreaming = false {
+        didSet {
+            if isStreaming && !oldValue && captionsEnabled {
+                captions.start(mode: selectedCaptionMode)
+            }
+        }
+    }
     private var isStopping = false
     private var isApplyingAdaptiveQuality = false
     private var pendingAdaptiveQuality: (MacStreamQuality, Int)?
 
     init() {
+        let captionTransport = transport
+        captions.onCaption = { cue in captionTransport.sendCaption(cue) }
         transport.onDevicesChanged = { [weak self] devices in
             guard let self else { return }
             self.devices = devices
@@ -208,10 +242,12 @@ final class MacStreamingModel {
             self.connectionState = state
             if case .failed = state {
                 self.isStreaming = false
+                self.captions.stop()
                 Task { await self.capture.stopRecording() }
             }
             if state == .disconnected {
                 self.isStreaming = false
+                self.captions.stop()
                 Task { await self.capture.stopRecording() }
             }
         }
@@ -232,6 +268,7 @@ final class MacStreamingModel {
         capture.onAudioFrame = { [weak self] frame in
             guard let self else { return }
             self.transport.sendAudio(frame.buffer)
+            self.captions.offer(frame.buffer)
         }
         transport.startDiscovery()
     }
@@ -350,6 +387,7 @@ final class MacStreamingModel {
         activeQuality = selectedQuality
         activeBitRate = selectedQuality.averageBitRate
         transport.configureVideo(maximumQuality: selectedQuality)
+        if captionsEnabled { captions.start(mode: selectedCaptionMode) }
         capture.startRecording(
             scale: selectedQuality.captureScale,
             showsCursor: true,
@@ -394,6 +432,7 @@ final class MacStreamingModel {
     func stopStreaming() {
         guard !isStopping else { return }
         isStopping = true
+        captions.stop()
         Task { @MainActor [weak self] in
             guard let self else { return }
             await capture.stopRecording()

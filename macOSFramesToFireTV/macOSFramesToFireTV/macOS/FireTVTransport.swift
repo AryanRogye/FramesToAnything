@@ -664,6 +664,27 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
         )
     }
 
+    /// At most one tiny caption waits behind media. No encoder interaction.
+    func sendCaption(_ cue: LiveCaptionCue) {
+        networkQueue.async { [weak self] in
+            guard let self, let connection,
+                  receiverFeatures.contains("live-captions-v1"),
+                  let key = currentStreamingKey(),
+                  let payload = try? JSONEncoder().encode(cue), payload.count <= 2048 else { return }
+            var plaintext = Data([Self.mediaVersion, 5])
+            plaintext.appendBigEndian(cue.startMs)
+            plaintext.append(0)
+            plaintext.append(payload)
+            guard let encrypted = try? AES.GCM.seal(plaintext, using: key).combined else { return }
+            var body = Data([Self.encryptedMediaPacket])
+            body.append(encrypted)
+            var packet = Data()
+            packet.appendBigEndian(UInt32(body.count))
+            packet.append(body)
+            enqueue(packet, kind: .caption, isKeyFrame: false, connection: connection)
+        }
+    }
+
     private func sendJSON(_ object: [String: Any]) {
         guard let payload = try? JSONSerialization.data(withJSONObject: object) else { return }
         sendPacket(type: Self.jsonPacket, payload: payload, kind: .control)
@@ -731,6 +752,9 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
                     stepQualityDown(now: .now)
                     return
                 }
+                pendingPackets.append(.init(data: packet, kind: kind, isKeyFrame: false))
+            case .caption:
+                pendingPackets.removeAll { $0.kind == .caption }
                 pendingPackets.append(.init(data: packet, kind: kind, isKeyFrame: false))
             case .control:
                 pendingPackets.append(.init(data: packet, kind: kind, isKeyFrame: false))
@@ -933,7 +957,7 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
     }
 
     private struct QueuedPacket {
-        enum Kind: Equatable { case control, audio, video }
+        enum Kind: Equatable { case control, audio, video, caption }
         let data: Data
         let kind: Kind
         let isKeyFrame: Bool
@@ -953,6 +977,7 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
     private static let cinemaFeatures: Set<String> = [
         ReceiverControlAuthentication.feature,
         "cinema-buffer-v1",
+        "live-captions-v1",
         receiverReportsFeature,
         "keyframe-request-v1",
         aacFeature,

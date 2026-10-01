@@ -41,6 +41,22 @@ class MainActivity : Activity(), PairingServer.Listener {
     private lateinit var liveBadge: LinearLayout
     private lateinit var connectionLagBadge: LinearLayout
     private lateinit var feedbackView: TextView
+    private lateinit var captionView: RollingCaptionView
+    private lateinit var captionAppearance: CaptionAppearance
+    private var captionEditor: CaptionAppearanceEditor? = null
+    private val captionTimeline = CaptionTimeline()
+    // Network input replaces this single slot, never posts one UI task per cue.
+    private val incomingCaption = java.util.concurrent.atomic.AtomicReference<CaptionCue?>(null)
+    private val updateCaptions = object : Runnable {
+        override fun run() {
+            val now = SystemClock.elapsedRealtime()
+            incomingCaption.getAndSet(null)?.let { captionTimeline.offer(it, now) }
+            val cue = captionTimeline.cue(mediaPlayer.captionMediaTimeMilliseconds(), now)
+            captionView.present(cue)
+            captionView.visibility = if (cue == null || !captionAppearance.enabled) View.INVISIBLE else View.VISIBLE
+            mainHandler.postDelayed(this, 100)
+        }
+    }
     private val mainHandler = Handler(Looper.getMainLooper())
     private var remoteControlsActive = false
     private var remotePlaybackIsPlaying = true
@@ -65,6 +81,7 @@ class MainActivity : Activity(), PairingServer.Listener {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.decorView.keepScreenOn = true
+        captionAppearance = CaptionAppearance(this)
         buildInterface()
         server = PairingServer(applicationContext, this)
         configureRemoteMediaSession()
@@ -89,12 +106,15 @@ class MainActivity : Activity(), PairingServer.Listener {
         })
         server.start()
         mainHandler.post(checkStreamDelivery)
+        mainHandler.post(updateCaptions)
     }
 
     override fun onDestroy() {
+        captionEditor?.dismiss()
         statusDotPulse?.cancel()
         mainHandler.removeCallbacks(hideFeedback)
         mainHandler.removeCallbacks(checkStreamDelivery)
+        mainHandler.removeCallbacks(updateCaptions)
         remoteMediaSession.isActive = false
         remoteMediaSession.release()
         server.stop()
@@ -178,7 +198,17 @@ class MainActivity : Activity(), PairingServer.Listener {
         mediaPlayer.queueAudio(data, timestampMilliseconds)
     }
 
+    override fun onCaption(id: String, revision: Long, startMs: Long, endMs: Long, text: String, final: Boolean, committedText: String?, partialText: String?) {
+        incomingCaption.set(CaptionCue(startMs, endMs, text, id, revision, final, committedText, partialText))
+    }
+
     override fun onMediaEnded() {
+        incomingCaption.set(null)
+        runOnUiThread {
+            captionTimeline.clear()
+            captionView.present(null)
+            captionView.visibility = View.INVISIBLE
+        }
         mediaPlayer.reset()
         runOnUiThread { setRemoteControlsActive(false) }
     }
@@ -407,6 +437,7 @@ class MainActivity : Activity(), PairingServer.Listener {
         }
         val restartButton = actionButton("Restart receiver") { restartReceiver() }
         controlsPanel.addView(hideButton)
+        controlsPanel.addView(actionButton("Captions") { showCaptionEditor() })
         controlsPanel.addView(resetButton)
         controlsPanel.addView(restartButton)
         root.addView(
@@ -439,9 +470,33 @@ class MainActivity : Activity(), PairingServer.Listener {
             ),
         )
 
+        captionView = RollingCaptionView(this)
+        root.addView(captionView, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL,
+        ).apply {
+            bottomMargin = dip(48)
+            leftMargin = dip(64)
+            rightMargin = dip(64)
+        })
+        captionView.applyAppearance(captionAppearance)
         setContentView(root)
         startStatusDotPulse()
         hideButton.post { hideButton.requestFocus() }
+    }
+
+    private fun showCaptionEditor() {
+        if (captionEditor?.isShowing == true) return
+        val editor = CaptionAppearanceEditor(this, captionAppearance) {
+            captionView.applyAppearance(captionAppearance)
+            captionView.visibility = if (captionAppearance.enabled && captionView.hasText) View.VISIBLE else View.INVISIBLE
+        }
+        captionEditor = editor
+        editor.setOnDismissListener {
+            captionEditor = null
+            controlsPanel.getChildAt(1)?.requestFocus()
+        }
+        editor.show()
     }
 
     private fun actionButton(title: String, action: () -> Unit) = Button(this).apply {

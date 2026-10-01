@@ -178,6 +178,7 @@ struct MacPairingView: View {
 final class MacStreamingModel {
     private let transport = MacFireTVTransport()
     private let capture = ScreenRecordService()
+    private let captions = LiveCaptionExperiment()
 
     var devices: [MacFireTVDevice] = []
     var selectedDeviceID: String?
@@ -196,6 +197,8 @@ final class MacStreamingModel {
     private var pendingAdaptiveQuality: (MacStreamQuality, Int)?
 
     init() {
+        let captionTransport = transport
+        captions.onCaption = { cue in captionTransport.sendCaption(cue) }
         transport.onDevicesChanged = { [weak self] devices in
             guard let self else { return }
             self.devices = devices
@@ -208,10 +211,12 @@ final class MacStreamingModel {
             self.connectionState = state
             if case .failed = state {
                 self.isStreaming = false
+                self.captions.stop()
                 Task { await self.capture.stopRecording() }
             }
             if state == .disconnected {
                 self.isStreaming = false
+                self.captions.stop()
                 Task { await self.capture.stopRecording() }
             }
         }
@@ -232,6 +237,7 @@ final class MacStreamingModel {
         capture.onAudioFrame = { [weak self] frame in
             guard let self else { return }
             self.transport.sendAudio(frame.buffer)
+            self.captions.offer(frame.buffer)
         }
         transport.startDiscovery()
     }
@@ -350,6 +356,7 @@ final class MacStreamingModel {
         activeQuality = selectedQuality
         activeBitRate = selectedQuality.averageBitRate
         transport.configureVideo(maximumQuality: selectedQuality)
+        captions.start()
         capture.startRecording(
             scale: selectedQuality.captureScale,
             showsCursor: true,
@@ -394,6 +401,7 @@ final class MacStreamingModel {
     func stopStreaming() {
         guard !isStopping else { return }
         isStopping = true
+        captions.stop()
         Task { @MainActor [weak self] in
             guard let self else { return }
             await capture.stopRecording()

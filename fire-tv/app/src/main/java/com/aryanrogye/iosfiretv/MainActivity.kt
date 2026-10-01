@@ -41,6 +41,25 @@ class MainActivity : Activity(), PairingServer.Listener {
     private lateinit var liveBadge: LinearLayout
     private lateinit var connectionLagBadge: LinearLayout
     private lateinit var feedbackView: TextView
+    private lateinit var captionView: TextView
+    private lateinit var captionAppearance: CaptionAppearance
+    private var captionEditor: CaptionAppearanceEditor? = null
+    private val captionTimeline = CaptionTimeline()
+    // Network input replaces this single slot, never posts one UI task per cue.
+    private val incomingCaption = java.util.concurrent.atomic.AtomicReference<CaptionCue?>(null)
+    private val updateCaptions = object : Runnable {
+        override fun run() {
+            val now = SystemClock.elapsedRealtime()
+            incomingCaption.getAndSet(null)?.let { captionTimeline.offer(it, now) }
+            val text = captionTimeline.text(mediaPlayer.captionMediaTimeMilliseconds(), now)
+            if (captionView.text.toString() != text) {
+                captionView.text = text
+                android.util.Log.i("FramesCaptions", if (text.isEmpty()) "cleared" else "displayed: $text")
+            }
+            captionView.visibility = if (text.isEmpty() || !captionAppearance.enabled) View.GONE else View.VISIBLE
+            mainHandler.postDelayed(this, 100)
+        }
+    }
     private val mainHandler = Handler(Looper.getMainLooper())
     private var remoteControlsActive = false
     private var remotePlaybackIsPlaying = true
@@ -65,6 +84,7 @@ class MainActivity : Activity(), PairingServer.Listener {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.decorView.keepScreenOn = true
+        captionAppearance = CaptionAppearance(this)
         buildInterface()
         server = PairingServer(applicationContext, this)
         configureRemoteMediaSession()
@@ -89,12 +109,15 @@ class MainActivity : Activity(), PairingServer.Listener {
         })
         server.start()
         mainHandler.post(checkStreamDelivery)
+        mainHandler.post(updateCaptions)
     }
 
     override fun onDestroy() {
+        captionEditor?.dismiss()
         statusDotPulse?.cancel()
         mainHandler.removeCallbacks(hideFeedback)
         mainHandler.removeCallbacks(checkStreamDelivery)
+        mainHandler.removeCallbacks(updateCaptions)
         remoteMediaSession.isActive = false
         remoteMediaSession.release()
         server.stop()
@@ -178,7 +201,17 @@ class MainActivity : Activity(), PairingServer.Listener {
         mediaPlayer.queueAudio(data, timestampMilliseconds)
     }
 
+    override fun onCaption(id: String, revision: Long, startMs: Long, endMs: Long, text: String, final: Boolean) {
+        incomingCaption.set(CaptionCue(startMs, endMs, text, id, revision, final))
+    }
+
     override fun onMediaEnded() {
+        incomingCaption.set(null)
+        runOnUiThread {
+            captionTimeline.clear()
+            captionView.text = ""
+            captionView.visibility = View.GONE
+        }
         mediaPlayer.reset()
         runOnUiThread { setRemoteControlsActive(false) }
     }
@@ -407,6 +440,7 @@ class MainActivity : Activity(), PairingServer.Listener {
         }
         val restartButton = actionButton("Restart receiver") { restartReceiver() }
         controlsPanel.addView(hideButton)
+        controlsPanel.addView(actionButton("Captions") { showCaptionEditor() })
         controlsPanel.addView(resetButton)
         controlsPanel.addView(restartButton)
         root.addView(
@@ -439,9 +473,43 @@ class MainActivity : Activity(), PairingServer.Listener {
             ),
         )
 
+        captionView = label(18f, Color.WHITE).apply {
+            gravity = Gravity.CENTER
+            maxLines = 3
+            setPadding(dip(16), dip(8), dip(16), dip(8))
+            setShadowLayer(3f, 0f, 2f, Color.BLACK)
+            background = rounded(dipf(8), Color.argb(200, 0, 0, 0))
+            visibility = View.GONE
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        }
+        root.addView(captionView, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL,
+        ).apply {
+            bottomMargin = dip(48)
+            leftMargin = dip(64)
+            rightMargin = dip(64)
+        })
+        captionAppearance.applyText(captionView)
+        captionAppearance.applyPosition(captionView)
         setContentView(root)
         startStatusDotPulse()
         hideButton.post { hideButton.requestFocus() }
+    }
+
+    private fun showCaptionEditor() {
+        if (captionEditor?.isShowing == true) return
+        val editor = CaptionAppearanceEditor(this, captionAppearance) {
+            captionAppearance.applyText(captionView)
+            captionAppearance.applyPosition(captionView)
+            captionView.visibility = if (captionAppearance.enabled && captionView.text.isNotEmpty()) View.VISIBLE else View.GONE
+        }
+        captionEditor = editor
+        editor.setOnDismissListener {
+            captionEditor = null
+            controlsPanel.getChildAt(1)?.requestFocus()
+        }
+        editor.show()
     }
 
     private fun actionButton(title: String, action: () -> Unit) = Button(this).apply {

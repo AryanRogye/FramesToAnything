@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		9B4B6D7730284A01008101B9 /* SnapCore in Frameworks */ = {isa = PBXBuildFile; productRef = 9B4B6D7630284A01008101B9 /* SnapCore */; };
+		CA0000010000000000000001 /* WhisperKit in Frameworks */ = {isa = PBXBuildFile; productRef = CA0000010000000000000003 /* WhisperKit */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -40,6 +41,7 @@
 			isa = PBXFrameworksBuildPhase;
 			files = (
 				9B4B6D7730284A01008101B9 /* SnapCore in Frameworks */,
+				CA0000010000000000000001 /* WhisperKit in Frameworks */,
 			);
 		};
 /* End PBXFrameworksBuildPhase section */
@@ -80,6 +82,7 @@
 			name = macOSFramesToFireTV;
 			packageProductDependencies = (
 				9B4B6D7630284A01008101B9 /* SnapCore */,
+				CA0000010000000000000003 /* WhisperKit */,
 			);
 			productName = macOSFramesToFireTV;
 			productReference = 9BE567053021803000D33AE6 /* macOSFramesToFireTV.app */;
@@ -111,6 +114,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				9B4B6D7530284A01008101B9 /* XCRemoteSwiftPackageReference "SnapCore" */,
+				CA0000010000000000000002 /* XCRemoteSwiftPackageReference "WhisperKit" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 9BE567063021803000D33AE6 /* Products */;
@@ -363,6 +367,14 @@
 				kind = branch;
 			};
 		};
+		CA0000010000000000000002 /* XCRemoteSwiftPackageReference "WhisperKit" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/argmaxinc/WhisperKit";
+			requirement = {
+				kind = exactVersion;
+				version = 1.0.0;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -370,6 +382,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 9B4B6D7530284A01008101B9 /* XCRemoteSwiftPackageReference "SnapCore" */;
 			productName = SnapCore;
+		};
+		CA0000010000000000000003 /* WhisperKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = CA0000010000000000000002 /* XCRemoteSwiftPackageReference "WhisperKit" */;
+			productName = WhisperKit;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

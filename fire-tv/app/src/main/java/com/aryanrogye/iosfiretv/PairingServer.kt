@@ -50,6 +50,7 @@ class PairingServer(
         fun onVideoFrame(data: ByteArray, timestampMilliseconds: Long, keyFrame: Boolean)
         fun onAudioConfiguration(sampleRate: Int, channels: Int, encoding: Int, codecConfig: ByteArray)
         fun onAudioFrame(data: ByteArray, timestampMilliseconds: Long)
+        fun onCaption(id: String, revision: Long, startMs: Long, endMs: Long, text: String, final: Boolean)
         fun onMediaEnded()
     }
 
@@ -136,6 +137,7 @@ class PairingServer(
                     .put(
                         "features",
                         JSONArray()
+                            .put(FEATURE_LIVE_CAPTIONS)
                             .put(FEATURE_CINEMA_BUFFER)
                             .put(FEATURE_RECEIVER_REPORTS)
                             .put(FEATURE_KEYFRAME_REQUEST)
@@ -165,6 +167,7 @@ class PairingServer(
                 }
             }
             negotiatedFeatures = requestedFeatures.intersect(SUPPORTED_FEATURES)
+            Log.i("FramesCaptions", "negotiated=${negotiatedFeatures.contains(FEATURE_LIVE_CAPTIONS)}")
             Log.i(TAG, "authentication request from ${deviceName ?: "unknown device"}")
             listener.onPairingRequest(deviceName)
             val clientChallenge = decode(auth.getString("challenge"))
@@ -323,6 +326,21 @@ class PairingServer(
                 MEDIA_VIDEO_FRAME -> listener.onVideoFrame(media, timestamp, keyFrame)
                 MEDIA_AUDIO_CONFIGURATION -> parseAudioConfiguration(media)
                 MEDIA_AUDIO_FRAME -> listener.onAudioFrame(media, timestamp)
+                MEDIA_CAPTION -> if (negotiatedFeatures.contains(FEATURE_LIVE_CAPTIONS)) {
+                    // A malformed optional caption must never tear down working media.
+                    if (media.size <= 2048) runCatching {
+                        val cue = JSONObject(String(media, Charsets.UTF_8))
+                        val end = cue.getLong("endMs")
+                        val text = cue.getString("text")
+                        if (timestamp >= 0 && end >= timestamp && end - timestamp <= 10_000 &&
+                            text.isNotBlank() && text.length <= 600) {
+                            val id = cue.optString("id", timestamp.toString()).take(64)
+                            val revision = cue.optLong("revision", 0)
+                            Log.i("FramesCaptions", "received id=$id revision=$revision")
+                            listener.onCaption(id, revision, timestamp, end, text, cue.optBoolean("final"))
+                        }
+                    }
+                }
             }
         }
     }
@@ -645,6 +663,8 @@ class PairingServer(
         const val MEDIA_VIDEO_FRAME = 2
         const val MEDIA_AUDIO_CONFIGURATION = 3
         const val MEDIA_AUDIO_FRAME = 4
+        const val MEDIA_CAPTION = 5
+        const val FEATURE_LIVE_CAPTIONS = "live-captions-v1"
         const val AUDIO_PCM_16 = 1
         const val AUDIO_AAC_LC = 2
         const val GCM_NONCE_BYTES = 12
@@ -660,6 +680,7 @@ class PairingServer(
         val SUPPORTED_FEATURES = setOf(
             ReceiverControlAuthentication.FEATURE,
             FEATURE_CINEMA_BUFFER,
+            FEATURE_LIVE_CAPTIONS,
             FEATURE_RECEIVER_REPORTS,
             FEATURE_KEYFRAME_REQUEST,
             FEATURE_REMOTE_MEDIA_CONTROLS,

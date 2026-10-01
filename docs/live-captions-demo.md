@@ -1,27 +1,31 @@
 # Mac → Fire TV live captions proof of concept
 
-The Mac generates English captions with WhisperKit `tiny.en`; Fire TV renders
-plain text above its unchanged video SurfaceView. This is an opt-in experiment.
+The Mac generates English subtitles with WhisperKit; Fire TV renders
+plain text above its unchanged video SurfaceView. Captions are enabled by default and controlled in the Mac menu.
 No subtitles are burned into frames. No cloud transcription or microphone is used.
 WhisperKit downloads model/tokenizer assets on first use, then runs locally.
 
 ## Run
 
 1. Build/install the Mac Release app and the Fire TV receiver from this revision.
-2. In the Mac Xcode scheme, add `FIRETV_LIVE_CAPTIONS=1` under Run → Arguments →
-   Environment Variables. For realistic performance, use Release configuration.
-   Alternatively, quit the app and launch its executable from Terminal:
+2. Launch the app normally from Applications. No environment variables or special
+   launch arguments are required. **Live Captions** in the Mac menu is enabled
+   by default and remembers your choice. Switch it off to stop caption audio
+   conversion and inference while keeping the video stream running.
 
-   ```sh
-   FIRETV_LIVE_CAPTIONS=1 /Applications/macOSFramesToFireTV.app/Contents/MacOS/macOSFramesToFireTV
-   ```
-
-3. Connect and start sharing as usual. Play English speech on the Mac. Look for
+3. Choose **Caption Mode** in the existing Mac menu:
+   - **English → English Captions** uses multilingual `base`, `.transcribe`, source `en`.
+   - **Hindi → English Translation** uses multilingual `small`, `.translate`, source `hi`.
+   The selection is saved. You can change it while streaming; only the caption
+   worker restarts. Its predecessor is cancelled and finishes before the new
+   model loads, so two inference workers cannot compete. Caption revisions start
+   fresh for the selected mode. Model downloads/loading continue in the background.
+   Connect and start sharing as usual. Play speech in the selected source language. Look for
    `[Captions] Ready` and `[Captions partial/final]` in the Mac console; first-use
    downloading/compilation can take time. Subtitles appear at the TV's bottom.
-4. To compare against the baseline, quit and launch without the environment
-   variable. Caption capture/inference is then inactive. Stop/start streaming
-   restarts a failed or thermally suspended caption session.
+4. To compare against the baseline, switch **Live Captions** off in the Mac menu.
+   Stop/start streaming, or toggle captions off/on, to restart a failed or
+   thermally suspended caption session.
 
 ## Isolation and bounds
 
@@ -38,13 +42,13 @@ WhisperKit downloads model/tokenizer assets on first use, then runs locally.
   and keeps a revisable tail. It never exports or repeatedly reads audio files.
   The built-in WhisperKit microphone stream is intentionally not used.
 - Model loading/storage follows the supplied file-transcriber approach, with a
-  smaller English-only model, no GPU compute, no fallback retries, one decode
+  multilingual base model, no GPU compute, no fallback retries, one decode
   worker, and a 128-token cap. A two-second callback budget is best effort, not
   Core ML preemption. Three consecutive slow passes or serious thermal pressure
   disable captions until the next streaming session.
 - Captions use negotiated `live-captions-v1`, encrypted media kind `5`, and the
   existing AES-GCM session. Payload is UTF-8 JSON (`id`, `revision`, `startMs`, `endMs`, `text`,
-  `final`), capped at 2 KB; header timestamp equals `startMs`. One pending caption
+  `final`, `committedText`, `partialText`), capped at 2 KB; header timestamp equals `startMs`. One pending caption
   replaces the previous one; caption overflow cannot restart encoders. Older
   receivers receive no captions. Audio/video packet formats remain unchanged.
 - Fire TV keeps one incoming cue, polls its existing playback clock at 10 Hz,
@@ -58,9 +62,10 @@ The existing ~750 ms is receiver playback buffering, not a sender-side deadline.
 WhisperKit may need more speech context and inference time than that. This demo
 allows late captions rather than increasing stream latency. Partial text updates one stable caption ID with increasing revisions. The Mac
 retains a committed prefix while replacing the unconfirmed tail; the TV rejects
-older revisions and partial updates after a final. Partial text can change; “final” is an age-based heuristic, not word-level agreement. Tiny English,
+older revisions and partial updates after a final. Partial text can change; “final” is an age-based heuristic, not word-level agreement. The base model,
 an energy gate, and latest-cue delivery trade accuracy/completeness for low load.
-Music can still produce hallucinated text. No speaker separation or translation.
+Music can still produce hallucinated text. No speaker separation. English uses multilingual `base`; Hindi translation uses larger multilingual `small` for improved accuracy. Hindi translation
+on short excerpts can still be imperfect.
 
 Use the same speech/video sequence with captions off and on. Compare visible
 smoothness, audio continuity, latency, receiver underruns/recoveries and adaptive
@@ -100,3 +105,33 @@ overlay. On/Off hides subtitles locally without changing the stream. Changes
 save automatically on the Fire TV. **Reset** restores the default appearance;
 **Done** or BACK closes the panel. The dialog leaves media capture and playback
 running.
+
+## Known-good checkpoint
+
+The working English captions and TV appearance editor were committed and pushed
+before adding mode selection: `d7ca298` on `feature/macOS_transcription`. The Hindi
+feature changes only the Mac mode selector and caption-worker configuration.
+
+Hindi mode was also exercised with Hindi video playing: the worker loaded
+multilingual `tiny`, emitted English output, and Fire TV logged received revisions
+and displayed them. Observed decode passes were approximately 70–670 ms. Some
+translations were unstable/repetitive; this validates the translation/rendering
+path rather than translation accuracy. Screenshot: `/tmp/firetv-hindi-translation.png`.
+
+## Stable two-line presentation
+
+The Mac sends a committed-text snapshot and replaceable partial text with every
+revision. The TV renders them in independent, left-aligned single-line rows.
+Finalized words stay on the upper row; partial revisions update only the lower
+row. The last finalized row remains while the next utterance starts. Overflow
+shows the recent end of each phrase, keeping a bounded rolling reading window.
+The overlay width and both row heights stay fixed during caption updates; only
+changing font size or position in the editor alters its layout. Expiry clears
+both rows. The original combined text remains available for older receivers.
+No extra delay, animation, transcription pass, or caption backlog is added.
+
+Verified fixed rows on the connected Fire TV: two hierarchy snapshots retained
+“Thank you.” at `[160,856][1760,912]` while the partial changed independently in
+`[160,912][1760,968]`. Each row stayed 56 px tall at the current size. Screenshot:
+`/tmp/firetv-stable-captions.png`. Presentation tests cover frozen finalized rows,
+partial replacement, final-to-next-utterance continuity, expiry, and missed revisions.

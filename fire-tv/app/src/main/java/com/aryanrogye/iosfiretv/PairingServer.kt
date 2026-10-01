@@ -50,7 +50,7 @@ class PairingServer(
         fun onVideoFrame(data: ByteArray, timestampMilliseconds: Long, keyFrame: Boolean)
         fun onAudioConfiguration(sampleRate: Int, channels: Int, encoding: Int, codecConfig: ByteArray)
         fun onAudioFrame(data: ByteArray, timestampMilliseconds: Long)
-        fun onCaption(id: String, revision: Long, startMs: Long, endMs: Long, text: String, final: Boolean)
+        fun onCaption(id: String, revision: Long, startMs: Long, endMs: Long, text: String, final: Boolean, committedText: String?, partialText: String?)
         fun onMediaEnded()
     }
 
@@ -337,7 +337,11 @@ class PairingServer(
                             val id = cue.optString("id", timestamp.toString()).take(64)
                             val revision = cue.optLong("revision", 0)
                             Log.i("FramesCaptions", "received id=$id revision=$revision")
-                            listener.onCaption(id, revision, timestamp, end, text, cue.optBoolean("final"))
+                            val committed = if (cue.has("committedText")) cue.getString("committedText") else null
+                            val partial = if (cue.has("partialText")) cue.getString("partialText") else null
+                            if ((committed?.length ?: 0) <= 600 && (partial?.length ?: 0) <= 600) {
+                                listener.onCaption(id, revision, timestamp, end, text, cue.optBoolean("final"), committed, partial)
+                            }
                         }
                     }
                 }

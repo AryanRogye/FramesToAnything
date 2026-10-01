@@ -6,6 +6,8 @@ nonisolated struct LiveCaptionCue: Sendable, Encodable {
     let startMs: UInt64
     let endMs: UInt64
     let text: String
+    let committedText: String
+    let partialText: String
     let final: Bool
 }
 
@@ -32,6 +34,7 @@ nonisolated struct CaptionRevisionState {
         revision += 1
         finished = partialText.isEmpty
         return LiveCaptionCue(id: id, revision: revision, startMs: max(startMs!, UInt64(max(0, (end - 6) * 1_000))),
-                              endMs: UInt64(max(0, end * 1_000)), text: text, final: finished)
+                              endMs: UInt64(max(0, end * 1_000)), text: text,
+                              committedText: committed, partialText: String(partialText.suffix(300)), final: finished)
     }
 }

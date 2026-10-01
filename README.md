@@ -411,7 +411,7 @@ This project is available under the [MIT License](LICENSE).
 
 ## Experimental live captions (Mac → Fire TV)
 
-An opt-in WhisperKit demo transcribes captured system audio on the Mac and displays
+The WhisperKit demo transcribes captured system audio on the Mac and displays
 subtitles on Fire TV without waiting in the video path. See
-[the demo guide](docs/live-captions-demo.md) for enabling it, its performance limits,
+[the demo guide](docs/live-captions-demo.md) for its menu controls, performance limits,
 and validation steps.

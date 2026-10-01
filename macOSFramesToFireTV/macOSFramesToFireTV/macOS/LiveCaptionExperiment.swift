@@ -5,16 +5,25 @@ import CoreML
 import Foundation
 @preconcurrency import WhisperKit
 
-/// Opt-in live caption demo. No caption code is called from the video callback.
+/// Live caption worker controlled by the menu-bar preference. No caption code is called from the video callback.
 @MainActor
 final class LiveCaptionExperiment {
-    private let enabled = ProcessInfo.processInfo.environment["FIRETV_LIVE_CAPTIONS"] == "1"
     var onCaption: (@Sendable (LiveCaptionCue) -> Void)?
     private var tap: CaptionAudioTap?
     private var worker: Task<Void, Never>?
+    private var mode: CaptionMode = .englishCaptions
 
-    func start() {
-        guard enabled, tap == nil else { return }
+    func changeMode(_ newMode: CaptionMode) {
+        guard newMode != mode else { return }
+        let wasActive = tap != nil
+        stop()
+        mode = newMode
+        if wasActive { start(mode: newMode) }
+    }
+
+    func start(mode: CaptionMode = .englishCaptions) {
+        guard tap == nil else { return }
+        self.mode = mode
         let tap = CaptionAudioTap()
         self.tap = tap
         let previous = worker
@@ -23,7 +32,7 @@ final class LiveCaptionExperiment {
             // Cancellation can take time inside Core ML; never overlap models.
             await previous?.value
             guard !Task.isCancelled else { return }
-            await Self.run(tap, onCaption: onCaption)
+            await Self.run(tap, mode: mode, onCaption: onCaption)
         }
     }
 
@@ -35,10 +44,10 @@ final class LiveCaptionExperiment {
         worker?.cancel()
     }
 
-    nonisolated private static func run(_ tap: CaptionAudioTap, onCaption: (@Sendable (LiveCaptionCue) -> Void)?) async {
+    nonisolated private static func run(_ tap: CaptionAudioTap, mode: CaptionMode, onCaption: (@Sendable (LiveCaptionCue) -> Void)?) async {
         defer { tap.close() }
         do {
-            print("[Captions] Preparing tiny.en; video continues independently.")
+            print("[Captions] Preparing \(mode.modelName) for \(mode.label); video continues independently.")
             var storage = try FileManager.default.url(
                 for: .applicationSupportDirectory, in: .userDomainMask,
                 appropriateFor: nil, create: true
@@ -47,10 +56,10 @@ final class LiveCaptionExperiment {
             var values = URLResourceValues()
             values.isExcludedFromBackup = true
             try storage.setResourceValues(values)
-            let folder = try await WhisperKit.download(variant: "tiny.en", downloadBase: storage)
+            let folder = try await WhisperKit.download(variant: mode.modelName, downloadBase: storage)
             try Task.checkCancellation()
             let kit = try await WhisperKit(WhisperKitConfig(
-                model: "tiny.en", downloadBase: storage, modelFolder: folder.path,
+                model: mode.modelName, downloadBase: storage, modelFolder: folder.path,
                 tokenizerFolder: storage,
                 computeOptions: ModelComputeOptions(
                     melCompute: .cpuOnly, audioEncoderCompute: .cpuAndNeuralEngine,
@@ -59,7 +68,7 @@ final class LiveCaptionExperiment {
                 verbose: false, prewarm: false, load: true, download: false
             ))
             try Task.checkCancellation()
-            print("[Captions] Ready. English system audio → 16 kHz mono; captions sent to compatible Fire TV receivers.")
+            print("[Captions] Ready. \(mode.label) → 16 kHz mono; captions sent to compatible Fire TV receivers.")
             var lastEnd = -Double.infinity
             var confirmedEnd = -Double.infinity
             var generation = -1
@@ -90,7 +99,8 @@ final class LiveCaptionExperiment {
                 guard energy > 0.00001 else { continue }
                 let started = ContinuousClock.now
                 let options = DecodingOptions(
-                    task: .transcribe, language: "en", temperatureFallbackCount: 0,
+                    task: mode == .hindiTranslation ? .translate : .transcribe,
+                    language: mode.sourceLanguage, temperatureFallbackCount: 0,
                     sampleLength: 128, skipSpecialTokens: true,
                     withoutTimestamps: false, wordTimestamps: false,
                     clipTimestamps: [Float(max(0, confirmedEnd - window.start))],

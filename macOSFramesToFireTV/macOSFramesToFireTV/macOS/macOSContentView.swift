@@ -62,6 +62,14 @@ struct MacMenuBarContent: View {
             }
             .disabled(model.isStreaming)
 
+            Toggle("Live Captions", isOn: $model.captionsEnabled)
+
+            Picker("Caption Mode", selection: $model.selectedCaptionMode) {
+                ForEach(CaptionMode.allCases) { mode in
+                    Text(mode.label).tag(mode)
+                }
+            }
+
             if model.isStreaming {
                 Button("Stop Streaming", systemImage: "stop.fill", role: .destructive) {
                     model.stopStreaming()
@@ -188,10 +196,33 @@ final class MacStreamingModel {
     var manualAddress = ""
     var pairingCode = ""
     var connectionState: MacFireTVConnectionState = .searching
+    var captionsEnabled = (UserDefaults.standard.object(forKey: "captions.enabled") as? Bool) ?? true {
+        didSet {
+            guard oldValue != captionsEnabled else { return }
+            UserDefaults.standard.set(captionsEnabled, forKey: "captions.enabled")
+            if captionsEnabled && isStreaming { captions.start(mode: selectedCaptionMode) }
+            if !captionsEnabled { captions.stop() }
+        }
+    }
+    var selectedCaptionMode = CaptionMode(
+        rawValue: UserDefaults.standard.string(forKey: "captions.mode") ?? ""
+    ) ?? .englishCaptions {
+        didSet {
+            guard oldValue != selectedCaptionMode else { return }
+            UserDefaults.standard.set(selectedCaptionMode.rawValue, forKey: "captions.mode")
+            captions.changeMode(selectedCaptionMode)
+        }
+    }
     var selectedQuality: MacStreamQuality = .fullHD
     private(set) var activeQuality: MacStreamQuality = .fullHD
     private(set) var activeBitRate = 10_000_000
-    var isStreaming = false
+    var isStreaming = false {
+        didSet {
+            if isStreaming && !oldValue && captionsEnabled {
+                captions.start(mode: selectedCaptionMode)
+            }
+        }
+    }
     private var isStopping = false
     private var isApplyingAdaptiveQuality = false
     private var pendingAdaptiveQuality: (MacStreamQuality, Int)?
@@ -356,7 +387,7 @@ final class MacStreamingModel {
         activeQuality = selectedQuality
         activeBitRate = selectedQuality.averageBitRate
         transport.configureVideo(maximumQuality: selectedQuality)
-        captions.start()
+        if captionsEnabled { captions.start(mode: selectedCaptionMode) }
         capture.startRecording(
             scale: selectedQuality.captureScale,
             showsCursor: true,

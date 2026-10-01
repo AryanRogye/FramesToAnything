@@ -12,7 +12,7 @@ let package = Package(
             name: "PlaybackPolicy",
             path: "macOSFramesToFireTV/macOS",
             exclude: ["FireTVTransport.swift", "macOSContentView.swift", "LiveCaptionExperiment.swift"],
-            sources: ["CaptionRevisionState.swift", "CaptionAudioTap.swift", "CaptionAudioWindow.swift", "ReceiverBufferPolicy.swift", "ReceiverControlAuthentication.swift"]
+            sources: ["CaptionMode.swift", "CaptionRevisionState.swift", "CaptionAudioTap.swift", "CaptionAudioWindow.swift", "ReceiverBufferPolicy.swift", "ReceiverControlAuthentication.swift"]
         ),
         .testTarget(name: "PlaybackPolicyTests", dependencies: ["PlaybackPolicy"])
     ]

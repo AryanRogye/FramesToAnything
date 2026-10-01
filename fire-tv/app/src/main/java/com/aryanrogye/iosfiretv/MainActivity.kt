@@ -41,7 +41,7 @@ class MainActivity : Activity(), PairingServer.Listener {
     private lateinit var liveBadge: LinearLayout
     private lateinit var connectionLagBadge: LinearLayout
     private lateinit var feedbackView: TextView
-    private lateinit var captionView: TextView
+    private lateinit var captionView: RollingCaptionView
     private lateinit var captionAppearance: CaptionAppearance
     private var captionEditor: CaptionAppearanceEditor? = null
     private val captionTimeline = CaptionTimeline()
@@ -51,12 +51,9 @@ class MainActivity : Activity(), PairingServer.Listener {
         override fun run() {
             val now = SystemClock.elapsedRealtime()
             incomingCaption.getAndSet(null)?.let { captionTimeline.offer(it, now) }
-            val text = captionTimeline.text(mediaPlayer.captionMediaTimeMilliseconds(), now)
-            if (captionView.text.toString() != text) {
-                captionView.text = text
-                android.util.Log.i("FramesCaptions", if (text.isEmpty()) "cleared" else "displayed: $text")
-            }
-            captionView.visibility = if (text.isEmpty() || !captionAppearance.enabled) View.GONE else View.VISIBLE
+            val cue = captionTimeline.cue(mediaPlayer.captionMediaTimeMilliseconds(), now)
+            captionView.present(cue)
+            captionView.visibility = if (cue == null || !captionAppearance.enabled) View.INVISIBLE else View.VISIBLE
             mainHandler.postDelayed(this, 100)
         }
     }
@@ -201,16 +198,16 @@ class MainActivity : Activity(), PairingServer.Listener {
         mediaPlayer.queueAudio(data, timestampMilliseconds)
     }
 
-    override fun onCaption(id: String, revision: Long, startMs: Long, endMs: Long, text: String, final: Boolean) {
-        incomingCaption.set(CaptionCue(startMs, endMs, text, id, revision, final))
+    override fun onCaption(id: String, revision: Long, startMs: Long, endMs: Long, text: String, final: Boolean, committedText: String?, partialText: String?) {
+        incomingCaption.set(CaptionCue(startMs, endMs, text, id, revision, final, committedText, partialText))
     }
 
     override fun onMediaEnded() {
         incomingCaption.set(null)
         runOnUiThread {
             captionTimeline.clear()
-            captionView.text = ""
-            captionView.visibility = View.GONE
+            captionView.present(null)
+            captionView.visibility = View.INVISIBLE
         }
         mediaPlayer.reset()
         runOnUiThread { setRemoteControlsActive(false) }
@@ -473,25 +470,16 @@ class MainActivity : Activity(), PairingServer.Listener {
             ),
         )
 
-        captionView = label(18f, Color.WHITE).apply {
-            gravity = Gravity.CENTER
-            maxLines = 3
-            setPadding(dip(16), dip(8), dip(16), dip(8))
-            setShadowLayer(3f, 0f, 2f, Color.BLACK)
-            background = rounded(dipf(8), Color.argb(200, 0, 0, 0))
-            visibility = View.GONE
-            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-        }
+        captionView = RollingCaptionView(this)
         root.addView(captionView, FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
             Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL,
         ).apply {
             bottomMargin = dip(48)
             leftMargin = dip(64)
             rightMargin = dip(64)
         })
-        captionAppearance.applyText(captionView)
-        captionAppearance.applyPosition(captionView)
+        captionView.applyAppearance(captionAppearance)
         setContentView(root)
         startStatusDotPulse()
         hideButton.post { hideButton.requestFocus() }
@@ -500,9 +488,8 @@ class MainActivity : Activity(), PairingServer.Listener {
     private fun showCaptionEditor() {
         if (captionEditor?.isShowing == true) return
         val editor = CaptionAppearanceEditor(this, captionAppearance) {
-            captionAppearance.applyText(captionView)
-            captionAppearance.applyPosition(captionView)
-            captionView.visibility = if (captionAppearance.enabled && captionView.text.isNotEmpty()) View.VISIBLE else View.GONE
+            captionView.applyAppearance(captionAppearance)
+            captionView.visibility = if (captionAppearance.enabled && captionView.hasText) View.VISIBLE else View.INVISIBLE
         }
         captionEditor = editor
         editor.setOnDismissListener {

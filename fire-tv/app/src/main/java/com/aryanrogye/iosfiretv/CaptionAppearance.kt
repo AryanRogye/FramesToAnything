@@ -27,29 +27,31 @@ internal class CaptionAppearance(context: Context) {
     var background = preferences.getInt("background", 2).coerceIn(BACKGROUNDS.indices)
     var position = preferences.getInt("position", 0).coerceIn(POSITIONS.indices)
 
+    var bottomSpacing = preferences.getInt("bottom_spacing", 48).coerceIn(0, 160)
+
     fun save() {
         preferences.edit().putBoolean("enabled", enabled).putInt("size", size)
             .putInt("color", color).putInt("background", background)
-            .putInt("position", position).apply()
+            .putInt("position", position).putInt("bottom_spacing", bottomSpacing).apply()
     }
 
     fun reset() {
-        enabled = true; size = 2; color = 0; background = 2; position = 0
+        enabled = true; size = 2; color = 0; background = 2; position = 0; bottomSpacing = 48
         save()
     }
 
-    fun applyText(view: TextView) {
+    fun applyText(view: TextView, includeBackground: Boolean = true) {
         val density = view.resources.displayMetrics.density
         view.textSize = SIZES[size]
         view.setTextColor(COLORS[color])
         view.setShadowLayer(3f, 0f, 2f, Color.BLACK)
-        view.background = GradientDrawable().apply {
+        if (includeBackground) view.background = GradientDrawable().apply {
             cornerRadius = 8 * density
             setColor(Color.argb(BACKGROUNDS[background], 0, 0, 0))
         }
     }
 
-    fun applyPosition(view: TextView) {
+    fun applyPosition(view: View) {
         val density = view.resources.displayMetrics.density
         (view.layoutParams as? FrameLayout.LayoutParams)?.let { params ->
             params.gravity = Gravity.CENTER_HORIZONTAL or when (position) {
@@ -58,7 +60,7 @@ internal class CaptionAppearance(context: Context) {
                 else -> Gravity.BOTTOM
             }
             params.topMargin = (48 * density).toInt()
-            params.bottomMargin = (48 * density).toInt()
+            params.bottomMargin = ((if (position == 0) bottomSpacing else 48) * density).toInt()
             view.layoutParams = params
         }
     }
@@ -127,6 +129,9 @@ internal class CaptionAppearanceEditor(
         }
         addRow(panel, { "Position: ${CaptionAppearance.POSITIONS[appearance.position]}" }) {
             appearance.position = cycle(appearance.position, it, CaptionAppearance.POSITIONS.size)
+        }
+        addRow(panel, { "Bottom spacing: ${appearance.bottomSpacing} · ← lower / higher →" }) {
+            appearance.bottomSpacing = (appearance.bottomSpacing + it * 8).coerceIn(0, 160)
         }
         val footer = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
         footer.addView(button("Reset").apply {

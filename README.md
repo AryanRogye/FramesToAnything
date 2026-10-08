@@ -415,3 +415,5 @@ The WhisperKit demo transcribes captured system audio on the Mac and displays
 subtitles on Fire TV without waiting in the video path. See
 [the demo guide](docs/live-captions-demo.md) for its menu controls, performance limits,
 and validation steps.
+
+For a reading order, folder map, and frame/audio/caption flow, see the [macOS code guide](docs/macOS-code-guide.md).

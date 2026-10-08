@@ -363,7 +363,7 @@
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/AryanRogye/SnapCore";
 			requirement = {
-				branch = "frames-to-anything";
+				branch = main;
 				kind = branch;
 			};
 		};

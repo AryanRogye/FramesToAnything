@@ -6,8 +6,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/AryanRogye/SnapCore",
       "state" : {
-        "branch" : "frames-to-anything",
-        "revision" : "16cfb76912bdc8050b23dea723ff04fc62ab90fd"
+        "branch" : "main",
+        "revision" : "2b28b5cdd6d4cb80b634b6b68938eb15715e4427"
       }
     },
     {
@@ -17,6 +17,15 @@
       "state" : {
         "revision" : "6a52f3251125d74daf04fcbd5e6f08a75d074382",
         "version" : "1.8.2"
+      }
+    },
+    {
+      "identity" : "swift-collections",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-collections.git",
+      "state" : {
+        "revision" : "98ef3c98609a1e31b7e157b5b619579001a789d6",
+        "version" : "1.7.1"
       }
     },
     {

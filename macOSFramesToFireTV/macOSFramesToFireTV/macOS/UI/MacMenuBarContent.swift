@@ -29,11 +29,10 @@ struct MacMenuBarContent: View {
                 }
             }
 
-            Button("Connect by IP Address…", systemImage: "network") {
-                model.prepareManualPairing()
-                showPairingWindow()
+            Button("Allow Incoming Connections", systemImage: "antenna.radiowaves.left.and.right") {
+                model.resumeConnections()
             }
-            .disabled(model.isStreaming || model.isBusy)
+            .disabled(!model.serverPaused)
 
             if model.selectedReceiverIsRemembered {
                 Button("Reset Connection & Pair Again…", systemImage: "arrow.counterclockwise") {
@@ -53,6 +52,11 @@ struct MacMenuBarContent: View {
             }
             .disabled(model.isStreaming)
 
+            Button("Choose Display…", systemImage: "display") {
+                model.chooseDisplay()
+            }
+            .disabled(!model.connectionState.isConnected)
+
             Toggle("Live Captions", isOn: $model.captionsEnabled)
 
             Picker("Caption Mode", selection: $model.selectedCaptionMode) {
@@ -66,7 +70,7 @@ struct MacMenuBarContent: View {
                     model.stopStreaming()
                 }
             } else {
-                Button("Choose Display & Start…", systemImage: "play.display") {
+                Button("Retry Capture", systemImage: "play.display") {
                     model.startStreaming()
                 }
                 .disabled(!model.connectionState.isConnected)

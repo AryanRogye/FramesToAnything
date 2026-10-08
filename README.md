@@ -70,11 +70,11 @@ This is the macOS-only SwiftUI sender target.
 
 The Mac version:
 
-- Captures a user-selected display with SnapCore and ScreenCaptureKit.
+- Automatically captures the main display with SnapCore and ScreenCaptureKit; optional display selection remains in the Mac menu.
 - Captures stereo system audio while excluding the microphone and the sender app's own audio.
 - Encodes H.264 in real time with B-frames disabled.
-- Discovers named Fire TV and iPhone/iPad receivers and targets only the selected device.
-- Advertises `_framesmac._tcp` so the Fire TV or iOS receiver can connect to it.
+- Discovers receivers for first-time pairing and authenticates incoming trusted receivers by their stable ID.
+- Keeps a TCP listener and `_framesmac._tcp` Bonjour advertisement alive while the app runs. Fire TV initiates the connection.
 - Uses the receiver's six-digit code once, then remembers that receiver securely for later sessions.
 - Treats HD, Full HD, QHD, and UHD as maximum-quality choices and adapts
   bitrate first, then resolution, without going below 720p.
@@ -159,12 +159,28 @@ ReplayKit may intentionally produce black video for DRM-protected content. Some 
 
 ### Mac → Fire TV
 
-1. Build and launch `fire-tv/` on the television.
-2. Open `macOSFramesToFireTV/macOSFramesToFireTV.xcodeproj` in Xcode.
-3. Run the `macOSFramesToFireTV` scheme with **My Mac** selected.
-4. Select the Fire TV. The first time, enter its displayed code and start pairing.
-5. On later sessions, select the remembered Fire TV and connect without a code.
-6. After authentication, choose a display and begin streaming.
+1. Run the `macOSFramesToFireTV` scheme with **My Mac** selected and grant Screen Recording permission once.
+2. Open the Fire TV app. It discovers and lists available Mac servers.
+3. For first-time pairing only, select the TV in the Mac menu and enter the six-digit code shown on the TV. This authorization lasts two minutes.
+4. On Fire TV, choose **Connect to your Mac**. Trusted authentication starts display/audio streaming automatically.
+5. Future sessions require only opening the apps and clicking Connect on Fire TV; no Mac receiver selection or Pair action is needed.
+
+The Mac always accepts the TCP connection; Fire TV always initiates it. Transient
+failures retry the selected Mac with bounded backoff and refreshed Bonjour
+addresses. Authentication failures require pairing rather than an endless retry
+loop. Negotiated encrypted/authenticated heartbeats recover silent connections.
+
+Fire TV **Disconnect** cancels reconnection. Mac **Stop Streaming** pauses incoming
+connections; choose **Allow Incoming Connections** in the Mac menu to resume.
+Optional **Choose Display…**, quality, captions, and remote controls remain available.
+Reset/restart diagnostics are under **More** on Fire TV.
+
+See [connection implementation and checklist](docs/connection-recovery-plan.md).
+To exercise an already paired TV against a running Mac server:
+
+```sh
+python3 scripts/verify-fire-tv-reconnect.py --serial FIRE_TV_IP:5555 --cycles 50
+```
 
 ### Mac → iPhone/iPad
 
@@ -177,7 +193,7 @@ ReplayKit may intentionally produce black video for DRM-protected content. Some 
 7. Choose a display on the Mac.
 8. Tap the expand button in the iOS preview to enter full-screen playback.
 
-The Mac includes the selected receiver's stable ID in its short-lived Bonjour advertisement, so other open receivers ignore that stream request.
+The Mac advertisement includes a stable sender ID. First-time code authorization is scoped to the selected receiver; saved trust is selected from the incoming handshake. Only one receiver session is accepted at a time.
 
 ## Protecting A/V synchronization
 
@@ -291,11 +307,11 @@ adaptive policy are what make video playback resilient.
 | Service | Advertised by | Discovered by |
 | --- | --- | --- |
 | `_iosfiretv._tcp` | Fire TV receiver | iOS sender and Mac sender |
-| `_framesmac._tcp` | Mac sender while waiting for a receiver | Fire TV receiver and iOS receiver |
+| `_framesmac._tcp` | Mac sender while the app is running | Fire TV receiver and iOS receiver |
 
-Fire TV also uses TCP port `49218` for the direct-IP fallback. The Mac sender uses a Bonjour-advertised listener endpoint.
+Fire TV retains TCP port `49218` for compatibility with the separate iOS sender. The Mac flow exclusively uses its Bonjour-advertised listener endpoint; it never opens an outgoing TCP connection to Fire TV.
 
-Receiver advertisements include a friendly service name plus a stable random receiver ID in the Bonjour TXT record. A Mac sender advertisement includes that ID as its target, preventing a different open receiver from racing to connect.
+Receiver advertisements include a friendly service name plus a stable random receiver ID in the Bonjour TXT record. The persistent Mac advertisement includes its stable `senderID`. The Mac requires mutual proof of saved trust or explicitly scoped first-time pairing before streaming to a receiver.
 
 ## Pairing protocol
 
@@ -308,7 +324,7 @@ The receiver generates the code and initiates the authenticated handshake after 
 5. Receiver returns a server proof so the sender also authenticates the receiver.
 6. Both sides use the derived key for AES-256-GCM media records.
 
-Incorrect or completed sessions rotate the receiver's pairing code.
+Ended sessions rotate the Fire TV receiver's pairing code.
 
 After a successful code-based pairing, both peers derive the same 256-bit remembered-device secret from the authenticated session without transmitting that secret. The Mac and iOS receiver store it in Keychain; the ReplayKit sender and its host app share it through their private app-group container; Fire TV stores it in app-private preferences with Android backup disabled. Future connections derive fresh session keys from the remembered secret, new random salt, and new challenges. If either side loses its saved state, the app falls back to one-time code pairing.
 
@@ -353,13 +369,17 @@ Media kinds:
 | `2` | Annex-B H.264 access unit |
 | `3` | Audio sample rate, channel count, encoding, and optional codec configuration |
 | `4` | PCM samples or one raw AAC-LC access unit |
+| `5` | Negotiated live-caption cue JSON |
+| `6` | Negotiated encrypted connection heartbeat |
 
 The maximum framed media record is 8 MiB. JSON handshake records are limited to 64 KiB.
 
 The handshake advertises optional `cinema-buffer-v1`, `receiver-report-v1`,
 `keyframe-request-v1`, `aac-lc-v1`, `remote-media-controls-v1`, and
-`authenticated-controls-v1`
-capabilities. Older peers continue to use the established PCM media path and
+`authenticated-controls-v1`, and `connection-heartbeat-v1`
+capabilities. Heartbeat-capable Mac/Fire TV sessions exchange encrypted media kind `6`
+and authenticated receiver `heartbeat` controls every two seconds. Unresponsive
+peers expire after twelve seconds; legacy peers keep their existing wire behavior. Older peers continue to use the established PCM media path and
 receive no unnegotiated remote-control messages.
 
 The first remote play/pause command may ask for macOS Accessibility permission.

@@ -11,7 +11,6 @@ struct MacPairingView: View {
     @FocusState private var focusedField: Field?
 
     private enum Field {
-        case address
         case code
     }
 
@@ -20,15 +19,8 @@ struct MacPairingView: View {
             VStack(alignment: .leading, spacing: 5) {
                 Label("Pair \(model.selectedReceiverName)", systemImage: "lock.shield")
                     .font(.title2.weight(.semibold))
-                Text("You will only need to do this once on this Mac.")
+                Text("Enter the TV’s code, then choose Connect on the TV. You only need to pair once.")
                     .foregroundStyle(.secondary)
-            }
-
-            if model.needsManualAddress {
-                TextField("Fire TV IP address", text: $model.manualAddress)
-                    .textFieldStyle(.roundedBorder)
-                    .focused($focusedField, equals: .address)
-                    .onSubmit { focusedField = .code }
             }
 
             TextField("Six-digit code", text: $model.pairingCode)
@@ -64,7 +56,7 @@ struct MacPairingView: View {
         .padding(22)
         .frame(width: 380)
         .task {
-            focusedField = model.needsManualAddress ? .address : .code
+            focusedField = .code
         }
         .onChange(of: model.connectionState) { _, state in
             if state.isConnected {

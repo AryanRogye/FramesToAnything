@@ -9,23 +9,23 @@ import SnapCore
 /// Encoded video/audio/caption packets, encryption, and the bounded network write queue.
 /// This extension uses the same transport state and queues; it creates no new pipeline.
 extension MacFireTVTransport {
-    func sendVideo(_ sampleBuffer: CMSampleBuffer) {
+    nonisolated func sendVideo(_ sampleBuffer: CMSampleBuffer) {
         guard currentStreamingKey() != nil, admitVideoFrame() else { return }
         mediaEncoder.encodeVideo(sampleBuffer)
     }
 
-    func sendVideo(_ imageBuffer: CVPixelBuffer, timestamp: CMTime) {
+    nonisolated func sendVideo(_ imageBuffer: CVPixelBuffer, timestamp: CMTime) {
         guard currentStreamingKey() != nil, admitVideoFrame() else { return }
         mediaEncoder.encodeVideo(imageBuffer, timestamp: timestamp)
     }
 
-    func sendAudio(_ sampleBuffer: CMSampleBuffer) {
+    nonisolated func sendAudio(_ sampleBuffer: CMSampleBuffer) {
         guard currentStreamingKey() != nil else { return }
         mediaEncoder.encodeAudio(sampleBuffer)
     }
 
-    func sendMedia(_ packet: LiveMediaPacket) {
-        guard let key = currentStreamingKey() else { return }
+    nonisolated func sendMedia(_ packet: LiveMediaPacket) {
+        guard let (key, generation) = mediaSession() else { return }
         let outgoingPackets: [LiveMediaPacket]
         if currentUsesAACAudio() {
             outgoingPackets = cinemaAACEncoder.transcode(packet) ?? [packet]
@@ -34,11 +34,11 @@ extension MacFireTVTransport {
         }
 
         for outgoingPacket in outgoingPackets {
-            encryptAndSend(outgoingPacket, using: key)
+            encryptAndSend(outgoingPacket, using: key, generation: generation)
         }
     }
 
-    func encryptAndSend(_ packet: LiveMediaPacket, using key: SymmetricKey) {
+    nonisolated func encryptAndSend(_ packet: LiveMediaPacket, using key: SymmetricKey, generation: UInt64) {
         if packet.kind == .videoConfiguration {
             macTransportLogger.info("Encrypting and sending video configuration, \(packet.payload.count) bytes")
         }
@@ -60,12 +60,13 @@ extension MacFireTVTransport {
             type: Self.encryptedMediaPacket,
             payload: encrypted,
             kind: kind,
-            isKeyFrame: packet.isKeyFrame
+            isKeyFrame: packet.isKeyFrame,
+            generation: generation
         )
     }
 
     /// At most one tiny caption waits behind media. No encoder interaction.
-    func sendCaption(_ cue: LiveCaptionCue) {
+    nonisolated func sendCaption(_ cue: LiveCaptionCue) {
         networkQueue.async { [weak self] in
             guard let self, let connection,
                   receiverFeatures.contains("live-captions-v1"),
@@ -85,29 +86,31 @@ extension MacFireTVTransport {
         }
     }
 
-    func sendJSON(_ object: [String: Any]) {
+    nonisolated func sendJSON(_ object: [String: Any]) {
         guard let payload = try? JSONSerialization.data(withJSONObject: object) else { return }
         sendPacket(type: Self.jsonPacket, payload: payload, kind: .control)
     }
 
-    func sendPacket(
+    nonisolated func sendPacket(
         type: UInt8,
         payload: Data,
         kind: QueuedPacket.Kind,
-        isKeyFrame: Bool = false
+        isKeyFrame: Bool = false,
+        generation: UInt64? = nil
     ) {
         var body = Data([type])
         body.append(payload)
         var length = UInt32(body.count).bigEndian
         var packet = Data(bytes: &length, count: MemoryLayout<UInt32>.size)
         packet.append(body)
+        let expectedGeneration = generation ?? currentMediaGeneration()
         networkQueue.async { [weak self] in
-            guard let self, let connection else { return }
+            guard let self, let connection, currentMediaGeneration() == expectedGeneration else { return }
             enqueue(packet, kind: kind, isKeyFrame: isKeyFrame, connection: connection)
         }
     }
 
-    func enqueue(
+    nonisolated func enqueue(
         _ packet: Data,
         kind: QueuedPacket.Kind,
         isKeyFrame: Bool,
@@ -164,10 +167,18 @@ extension MacFireTVTransport {
         write(.init(data: packet, kind: kind, isKeyFrame: isKeyFrame), using: connection)
     }
 
-    func write(_ packet: QueuedPacket, using connection: NWConnection) {
+    nonisolated func write(_ packet: QueuedPacket, using connection: NWConnection) {
         writeInFlight = true
+        let deadline = DispatchWorkItem { [weak self, weak connection] in
+            guard let self, let connection, connection === self.connection else { return }
+            fail("Network write stalled. Ready to reconnect.")
+        }
+        writeDeadline = deadline
+        networkQueue.asyncAfter(deadline: .now() + 12, execute: deadline)
         connection.send(content: packet.data, completion: .contentProcessed { [weak self, weak connection] error in
             guard let self, let connection, connection === self.connection else { return }
+            writeDeadline?.cancel()
+            writeDeadline = nil
             writeInFlight = false
             if let error {
                 fail("Could not send media: \(error.localizedDescription)")

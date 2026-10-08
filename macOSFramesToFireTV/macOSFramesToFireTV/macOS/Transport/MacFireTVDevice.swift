@@ -2,20 +2,20 @@
 import Foundation
 import Network
 
-struct MacFireTVDevice: Identifiable, Sendable, Equatable {
+nonisolated struct MacFireTVDevice: Identifiable, Sendable, Equatable {
     let id: String
     let name: String
     let endpoint: NWEndpoint
     let receiverID: String?
 
-    var isRemembered: Bool {
+    nonisolated var isRemembered: Bool {
         receiverID.map(TrustedReceiverStore.contains) ?? false
     }
 
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
 }
 
-enum MacFireTVConnectionState: Sendable, Equatable {
+nonisolated enum MacFireTVConnectionState: Sendable, Equatable {
     case searching
     case waitingForReceiver
     case connecting(String)

@@ -23,6 +23,7 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
         qos: .userInteractive
     )
     let keyLock = NSLock()
+    var stateRevision: UInt64 = 0
     let frameAdmissionLock = NSLock()
     let mediaEncoder: LiveMediaEncoder
     let cinemaAACEncoder = CinemaAACEncoder()
@@ -48,6 +49,19 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
         }
     }
 
+    var serverRunning = false
+    var acceptingConnections = true
+    var listenerRetry: DispatchWorkItem?
+    var browserRetry: DispatchWorkItem?
+    var listenerFailures = 0
+    var handshakeDeadline: DispatchWorkItem?
+    var heartbeatTimer: DispatchSourceTimer?
+    var lastAuthenticatedControl = ContinuousClock.now
+    var session = ConnectionSessionPolicy()
+    var pairingTarget: String?
+    var pairingExpiresAt: ContinuousClock.Instant?
+    var mediaGeneration: UInt64 = 0 // keyLock owns this with streamingKey
+    static let heartbeatFeature = "connection-heartbeat-v1"
     var browser: NWBrowser?
     var listener: NWListener?
     var connection: NWConnection?
@@ -63,6 +77,7 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
     var handshakeKey: SymmetricKey?
     var streamingKey: SymmetricKey?
     var usesAACAudio = false
+    var writeDeadline: DispatchWorkItem?
     var writeInFlight = false
     var pendingPackets: [QueuedPacket] = []
     var waitingForCleanVideoFrame = false
@@ -80,28 +95,58 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
     // Shared with this type’s extensions; session mutations remain on networkQueue.
 
     func fail(_ message: String) {
-        connection?.cancel()
-        connection = nil
-        listener?.cancel()
-        listener = nil
-        clearSession()
+        endSession()
         report(.failed(message))
     }
 
-    func rejectUnexpectedReceiver() {
-        let unexpectedConnection = connection
+    func endSession() {
+        let old = connection
         connection = nil
-        unexpectedConnection?.cancel()
+        old?.cancel()
+        session.end()
+        handshakeDeadline?.cancel()
+        handshakeDeadline = nil
+        writeDeadline?.cancel()
+        writeDeadline = nil
+        heartbeatTimer?.cancel()
+        heartbeatTimer = nil
+        mediaEncoder.stop()
         clearHandshakeState()
-        report(.waitingForReceiver)
-    }
-
-    func clearSession() {
-        clearHandshakeState()
-        pairingCode = ""
         receiverID = nil
         rememberedSecret = nil
         usedRememberedSecret = false
+    }
+
+    func rejectUnexpectedReceiver() {
+        endSession()
+        report(.waitingForReceiver)
+    }
+
+    func startHeartbeat() {
+        guard receiverFeatures.contains(Self.heartbeatFeature),
+              receiverFeatures.contains(ReceiverControlAuthentication.feature) else { return }
+        lastAuthenticatedControl = .now
+        let generation = session.generation
+        let timer = DispatchSource.makeTimerSource(queue: networkQueue)
+        timer.schedule(deadline: .now(), repeating: .seconds(2))
+        timer.setEventHandler { [weak self] in
+            guard let self, session.generation == generation,
+                  let key = currentStreamingKey() else { return }
+            guard lastAuthenticatedControl.duration(to: .now) < .seconds(12) else {
+                fail("Receiver stopped responding. Ready to reconnect.")
+                return
+            }
+            var plaintext = Data([Self.mediaVersion, 6])
+            plaintext.appendBigEndian(UInt64(0))
+            plaintext.append(0)
+            plaintext.append(0) // retain the existing minimum encrypted-record size
+            if let encrypted = try? AES.GCM.seal(plaintext, using: key).combined {
+                sendPacket(type: Self.encryptedMediaPacket, payload: encrypted,
+                           kind: .control, generation: currentMediaGeneration())
+            }
+        }
+        heartbeatTimer = timer
+        timer.resume()
     }
 
     func clearHandshakeState() {
@@ -125,7 +170,16 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
     }
 
     func setStreamingKey(_ key: SymmetricKey?) {
-        keyLock.withLock { streamingKey = key }
+        keyLock.withLock {
+            mediaGeneration &+= 1
+            streamingKey = key
+        }
+    }
+
+    func currentMediaGeneration() -> UInt64 { keyLock.withLock { mediaGeneration } }
+
+    func mediaSession() -> (SymmetricKey, UInt64)? {
+        keyLock.withLock { streamingKey.map { ($0, mediaGeneration) } }
     }
 
     func currentUsesAACAudio() -> Bool {
@@ -157,8 +211,12 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
     }
 
     func report(_ state: MacFireTVConnectionState) {
+        let revision = keyLock.withLock { stateRevision &+= 1; return stateRevision }
         let callback = onStateChanged
-        Task { @MainActor in callback?(state) }
+        Task { @MainActor [weak self] in
+            guard let self, keyLock.withLock({ self.stateRevision == revision }) else { return }
+            callback?(state)
+        }
     }
 
     func publish(_ devices: [MacFireTVDevice]) {
@@ -186,6 +244,7 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
     static let remoteMediaControlsFeature = "remote-media-controls-v1"
     static let cinemaFeatures: Set<String> = [
         ReceiverControlAuthentication.feature,
+        heartbeatFeature,
         "cinema-buffer-v1",
         "live-captions-v1",
         receiverReportsFeature,

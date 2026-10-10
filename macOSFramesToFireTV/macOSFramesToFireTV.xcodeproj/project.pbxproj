@@ -9,7 +9,21 @@
 /* Begin PBXBuildFile section */
 		9B4B6D7730284A01008101B9 /* SnapCore in Frameworks */ = {isa = PBXBuildFile; productRef = 9B4B6D7630284A01008101B9 /* SnapCore */; };
 		CA0000010000000000000001 /* WhisperKit in Frameworks */ = {isa = PBXBuildFile; productRef = CA0000010000000000000003 /* WhisperKit */; };
+		D10000010000000000000001 /* MediaRemoteAdapter in Frameworks */ = {isa = PBXBuildFile; productRef = D10000010000000000000003 /* MediaRemoteAdapter */; };
+		D10000010000000000000004 /* MediaRemoteAdapter in Embed Frameworks */ = {isa = PBXBuildFile; productRef = D10000010000000000000003 /* MediaRemoteAdapter */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		D10000010000000000000005 /* Embed Frameworks */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (D10000010000000000000004 /* MediaRemoteAdapter in Embed Frameworks */, );
+			name = "Embed Frameworks";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
 		9BE567053021803000D33AE6 /* macOSFramesToFireTV.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = macOSFramesToFireTV.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -42,6 +56,7 @@
 			files = (
 				9B4B6D7730284A01008101B9 /* SnapCore in Frameworks */,
 				CA0000010000000000000001 /* WhisperKit in Frameworks */,
+				D10000010000000000000001 /* MediaRemoteAdapter in Frameworks */,
 			);
 		};
 /* End PBXFrameworksBuildPhase section */
@@ -73,6 +88,7 @@
 				9BE567013021803000D33AE6 /* Sources */,
 				9BE567023021803000D33AE6 /* Frameworks */,
 				9BE567033021803000D33AE6 /* Resources */,
+				D10000010000000000000005 /* Embed Frameworks */,
 			);
 			buildRules = (
 			);
@@ -83,6 +99,7 @@
 			packageProductDependencies = (
 				9B4B6D7630284A01008101B9 /* SnapCore */,
 				CA0000010000000000000003 /* WhisperKit */,
+				D10000010000000000000003 /* MediaRemoteAdapter */,
 			);
 			productName = macOSFramesToFireTV;
 			productReference = 9BE567053021803000D33AE6 /* macOSFramesToFireTV.app */;
@@ -115,6 +132,7 @@
 			packageReferences = (
 				9B4B6D7530284A01008101B9 /* XCRemoteSwiftPackageReference "SnapCore" */,
 				CA0000010000000000000002 /* XCRemoteSwiftPackageReference "WhisperKit" */,
+				D10000010000000000000002 /* XCRemoteSwiftPackageReference "MediaRemoteAdapter" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 9BE567063021803000D33AE6 /* Products */;
@@ -375,6 +393,11 @@
 				version = 1.0.0;
 			};
 		};
+		D10000010000000000000002 /* XCRemoteSwiftPackageReference "MediaRemoteAdapter" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/ejbills/mediaremote-adapter.git";
+			requirement = { kind = revision; revision = 5b6afde3f501a3da567e23bf7f23d562938a1809; };
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -387,6 +410,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = CA0000010000000000000002 /* XCRemoteSwiftPackageReference "WhisperKit" */;
 			productName = WhisperKit;
+		};
+		D10000010000000000000003 /* MediaRemoteAdapter */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = D10000010000000000000002 /* XCRemoteSwiftPackageReference "MediaRemoteAdapter" */;
+			productName = MediaRemoteAdapter;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

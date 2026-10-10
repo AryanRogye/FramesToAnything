@@ -10,7 +10,7 @@ import SnapCore
 /// Incoming JSON framing, pairing authentication, remembered trust, and receiver commands.
 /// This extension uses the same transport state and queues; it creates no new pipeline.
 extension MacFireTVTransport {
-    func receiveNextChunk(from connection: NWConnection) {
+    nonisolated func receiveNextChunk(from connection: NWConnection) {
         connection.receive(
             minimumIncompleteLength: 1,
             maximumLength: 64 * 1024
@@ -33,7 +33,7 @@ extension MacFireTVTransport {
         }
     }
 
-    func processPackets() {
+    nonisolated func processPackets() {
         while receiveBuffer.count >= 4 {
             let length = receiveBuffer.prefix(4).reduce(UInt32(0)) {
                 ($0 << 8) | UInt32($1)
@@ -51,7 +51,7 @@ extension MacFireTVTransport {
         }
     }
 
-    func handleJSON(_ bytes: Data.SubSequence) {
+    nonisolated func handleJSON(_ bytes: Data.SubSequence) {
         guard var object = try? JSONSerialization.jsonObject(with: Data(bytes)) as? [String: Any],
               var type = object["type"] as? String else {
             fail("The Fire TV sent an unreadable authentication message.")
@@ -66,6 +66,7 @@ extension MacFireTVTransport {
                     object, key: key, server: serverChallenge, client: clientChallenge,
                     lastSequence: &lastControlSequence
                   ), let verifiedType = verified["type"] as? String else { return }
+            lastAuthenticatedControl = .now
             object = verified
             type = verifiedType
         } else if !["hello", "auth_ok", "auth_failed"].contains(type) {
@@ -73,25 +74,38 @@ extension MacFireTVTransport {
         }
         switch type {
         case "hello":
+            guard session.phase == .awaitingHello else { fail("Unexpected handshake message."); return }
             guard (object["version"] as? Int) == 1,
                   let saltValue = object["salt"] as? String,
                   let challengeValue = object["challenge"] as? String,
                   let salt = Data(base64Encoded: saltValue),
                   let serverChallenge = Data(base64Encoded: challengeValue),
-                  serverChallenge.count == 32 else {
+                  salt.count == 16, serverChallenge.count == 32 else {
                 fail("The receiver uses an unsupported authentication protocol.")
                 return
             }
             let clientChallenge = Self.randomData(count: 32)
             receiverFeatures = Set(object["features"] as? [String] ?? [])
             let helloReceiverID = object["receiverID"] as? String
-            if let expectedID = receiverID,
+            if let expectedID = pairingTarget,
                let helloReceiverID,
                expectedID != helloReceiverID {
                 rejectUnexpectedReceiver()
                 return
             }
             receiverID = helloReceiverID ?? receiverID
+            if let receiverID { rememberedSecret = TrustedReceiverStore.load(receiverID) }
+            if let receiverID {
+                connectedName = "Receiver \(receiverID.prefix(8))"
+            }
+            let authorizedCode = ConnectionSessionPolicy.permitsCode(
+                code: pairingCode, target: pairingTarget, receiver: receiverID,
+                expiresAt: pairingExpiresAt, now: .now
+            )
+            guard rememberedSecret != nil || authorizedCode else {
+                rejectForPairing()
+                return
+            }
             let trustedSecret = rememberedSecret
             let keyData: Data?
             let mode: String
@@ -116,6 +130,7 @@ extension MacFireTVTransport {
             self.serverChallenge = serverChallenge
             self.clientChallenge = clientChallenge
             handshakeKey = key
+            _ = session.receivedHello(generation: session.generation)
             report(.authenticating(usedRememberedSecret))
             let proof = Self.authenticationCode(
                 key: key,
@@ -134,6 +149,7 @@ extension MacFireTVTransport {
             ])
 
         case "auth_ok":
+            guard session.phase == .authenticating else { fail("Unexpected authentication response."); return }
             guard let proofValue = object["proof"] as? String,
                   let suppliedProof = Data(base64Encoded: proofValue),
                   let key = handshakeKey,
@@ -169,19 +185,25 @@ extension MacFireTVTransport {
                     withServiceName: connectedName
                 )
             }
-            listener?.cancel()
-            listener = nil
+            _ = session.authenticated(generation: session.generation)
+            handshakeDeadline?.cancel()
+            handshakeDeadline = nil
+            pairingCode = ""
+            pairingTarget = nil
+            pairingExpiresAt = nil
             setUsesAACAudio(receiverFeatures.contains(Self.aacFeature))
             setStreamingKey(key)
+            startHeartbeat()
             report(.connected(connectedName))
 
         case "auth_failed":
-            if usedRememberedSecret, let receiverID {
-                TrustedReceiverStore.delete(receiverID)
+            if usedRememberedSecret {
                 fail("This receiver no longer remembers your Mac. Enter its current code once to pair again.")
             } else {
                 fail("That pairing code was not accepted. The receiver has generated a new code.")
             }
+        case "heartbeat":
+            break
         case "request_keyframe":
             guard currentStreamingKey() != nil,
                   receiverFeatures.contains("keyframe-request-v1") else { return }
@@ -196,18 +218,52 @@ extension MacFireTVTransport {
         case "remote_media_command":
             guard currentStreamingKey() != nil,
                   receiverFeatures.contains(Self.remoteMediaControlsFeature),
-                  object["command"] as? String == "toggle_play_pause" else { return }
-            let now = ContinuousClock.now
-            guard lastRemoteMediaCommand.duration(to: now) >= .milliseconds(200) else { return }
-            lastRemoteMediaCommand = now
-            MacMediaKeyController.togglePlayPause()
+                  let value = object["command"] as? String,
+                  let command = RemoteMediaCommand(rawValue: value) else { return }
+            if command.seekOffset != nil {
+                guard receiverFeatures.contains(Self.remoteSeekFeature),
+                      let requestID = object["requestID"] as? String,
+                      UUID(uuidString: requestID) != nil else { return }
+                let now = ContinuousClock.now
+                guard lastRemoteMediaCommand.duration(to: now) >= .milliseconds(200) else { return }
+                lastRemoteMediaCommand = now
+                let generation = currentMediaGeneration()
+                Task { @MainActor [weak self] in
+                    guard let self, currentMediaGeneration() == generation else { return }
+                    MacRemoteSeekController.shared.seek(command: command, isCurrent: { [weak self] in
+                        self?.currentMediaGeneration() == generation
+                    }, completion: { [weak self] status in
+                        self?.sendRemoteSeekResult(requestID: requestID, command: command,
+                                                   status: status, generation: generation)
+                    })
+                }
+            } else {
+                let now = ContinuousClock.now
+                guard lastRemoteMediaCommand.duration(to: now) >= .milliseconds(200) else { return }
+                lastRemoteMediaCommand = now
+                MacMediaKeyController.togglePlayPause()
+            }
 
         default:
             break
         }
     }
 
-    static func deriveKey(code: String, salt: Data) -> Data? {
+    nonisolated func rejectForPairing() {
+        guard let connection,
+              let payload = try? JSONSerialization.data(withJSONObject: ["type": "pairing_required"]) else { return }
+        var body = Data([Self.jsonPacket])
+        body.append(payload)
+        var record = Data()
+        record.appendBigEndian(UInt32(body.count))
+        record.append(body)
+        connection.send(content: record, completion: .contentProcessed { [weak self, weak connection] _ in
+            guard let self, let connection, connection === self.connection else { return }
+            fail("Pairing required. Enter the TV’s code on the Mac, then Connect on the TV.")
+        })
+    }
+
+    nonisolated static func deriveKey(code: String, salt: Data) -> Data? {
         var derived = Data(count: 32)
         let status = code.withCString { password in
             salt.withUnsafeBytes { saltBytes in
@@ -229,7 +285,7 @@ extension MacFireTVTransport {
         return status == kCCSuccess ? derived : nil
     }
 
-    static func deriveRememberedSessionKey(
+    nonisolated static func deriveRememberedSessionKey(
         secret: Data,
         salt: Data,
         serverChallenge: Data,
@@ -245,7 +301,7 @@ extension MacFireTVTransport {
         ))
     }
 
-    static func deriveTrustSecret(
+    nonisolated static func deriveTrustSecret(
         key: SymmetricKey,
         serverChallenge: Data,
         clientChallenge: Data
@@ -256,7 +312,7 @@ extension MacFireTVTransport {
         return Data(HMAC<SHA256>.authenticationCode(for: message, using: key))
     }
 
-    static func authenticationCode(
+    nonisolated static func authenticationCode(
         key: SymmetricKey,
         label: String,
         serverChallenge: Data,
@@ -268,12 +324,12 @@ extension MacFireTVTransport {
         return Data(HMAC<SHA256>.authenticationCode(for: message, using: key))
     }
 
-    static func constantTimeEqual(_ lhs: Data, _ rhs: Data) -> Bool {
+    nonisolated static func constantTimeEqual(_ lhs: Data, _ rhs: Data) -> Bool {
         guard lhs.count == rhs.count else { return false }
         return zip(lhs, rhs).reduce(UInt8(0)) { $0 | ($1.0 ^ $1.1) } == 0
     }
 
-    static func randomData(count: Int) -> Data {
+    nonisolated static func randomData(count: Int) -> Data {
         var bytes = [UInt8](repeating: 0, count: count)
         precondition(SecRandomCopyBytes(kSecRandomDefault, count, &bytes) == errSecSuccess)
         return Data(bytes)

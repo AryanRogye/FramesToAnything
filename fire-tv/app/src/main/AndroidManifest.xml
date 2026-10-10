@@ -18,6 +18,7 @@
         android:theme="@style/Theme.IOSFireTV">
         <activity
             android:name=".MainActivity"
+            android:launchMode="singleTask"
             android:configChanges="keyboardHidden|orientation|screenSize"
             android:exported="true">
             <intent-filter>

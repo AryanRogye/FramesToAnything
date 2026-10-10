@@ -26,12 +26,18 @@ import android.widget.ProgressBar
 import android.widget.TextView
 
 class MainActivity : Activity(), PairingServer.Listener {
+    private val receiverCallbackLock = Any()
+    @Volatile private var receiverGeneration = 0L
+    private var receiverForeground = false
+    private var receiverNeedsRecreation = false
     private lateinit var server: PairingServer
     private lateinit var surfaceView: SurfaceView
     private lateinit var mediaPlayer: FireTVMediaPlayer
     private lateinit var remoteMediaSession: MediaSession
     private lateinit var statusView: TextView
     private lateinit var statusDot: View
+    private lateinit var macList: LinearLayout
+    private var displayedMacs: List<MacServer> = emptyList()
     private lateinit var codeView: TextView
     private lateinit var instructionsView: TextView
     private lateinit var pairingPanel: LinearLayout
@@ -61,6 +67,8 @@ class MainActivity : Activity(), PairingServer.Listener {
     private var remoteControlsActive = false
     private var remotePlaybackIsPlaying = true
     private var lastRemoteCommandTime = 0L
+    private var pendingSeekID: String? = null
+    private var pendingSeekCommand: String? = null
     private var pairingPanelVisible = true
     private var streamingActive = false
     private var statusDotPulse: ValueAnimator? = null
@@ -78,12 +86,50 @@ class MainActivity : Activity(), PairingServer.Listener {
         }.start()
     }
 
+    /** Old receiver instances must never update this Activity after replacement. */
+    private fun createReceiver(): PairingServer {
+        val generation = synchronized(receiverCallbackLock) { ++receiverGeneration }
+        fun ui(action: () -> Unit) = mainHandler.post {
+            if (generation == receiverGeneration && !isDestroyed) action()
+        }
+        fun media(action: () -> Unit) = synchronized(receiverCallbackLock) {
+            if (generation == receiverGeneration) action()
+        }
+        return PairingServer(applicationContext, object : PairingServer.Listener {
+            override fun onMacsChanged(macs: List<MacServer>) { ui { this@MainActivity.onMacsChanged(macs) } }
+            override fun onPairingCode(code: String) { ui { this@MainActivity.onPairingCode(code) } }
+            override fun onPairingRequest(deviceName: String?) { ui { this@MainActivity.onPairingRequest(deviceName) } }
+            override fun onStatus(message: String, streaming: Boolean) { ui { this@MainActivity.onStatus(message, streaming) } }
+            override fun onVideoConfiguration(width: Int, height: Int, rotationDegrees: Int, sps: ByteArray, pps: ByteArray) {
+                media { this@MainActivity.onVideoConfiguration(width, height, rotationDegrees, sps, pps) }
+            }
+            override fun onVideoFrame(data: ByteArray, timestampMilliseconds: Long, keyFrame: Boolean) {
+                media { this@MainActivity.onVideoFrame(data, timestampMilliseconds, keyFrame) }
+            }
+            override fun onAudioConfiguration(sampleRate: Int, channels: Int, encoding: Int, codecConfig: ByteArray) {
+                media { this@MainActivity.onAudioConfiguration(sampleRate, channels, encoding, codecConfig) }
+            }
+            override fun onAudioFrame(data: ByteArray, timestampMilliseconds: Long) {
+                media { this@MainActivity.onAudioFrame(data, timestampMilliseconds) }
+            }
+            override fun onCaption(id: String, revision: Long, startMs: Long, endMs: Long, text: String, final: Boolean, committedText: String?, partialText: String?) {
+                media { this@MainActivity.onCaption(id, revision, startMs, endMs, text, final, committedText, partialText) }
+            }
+            override fun onRemoteSeekResult(requestID: String, command: String, status: String) {
+                ui { this@MainActivity.onRemoteSeekResult(requestID, command, status) }
+            }
+            override fun onMediaEnded() {
+                media { this@MainActivity.onMediaEnded() }
+            }
+        })
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.decorView.keepScreenOn = true
         captionAppearance = CaptionAppearance(this)
         buildInterface()
-        server = PairingServer(applicationContext, this)
+        server = createReceiver()
         configureRemoteMediaSession()
         mediaPlayer = FireTVMediaPlayer(
             // Resolve the current server when each callback fires. The receiver
@@ -104,12 +150,51 @@ class MainActivity : Activity(), PairingServer.Listener {
                 mediaPlayer.setSurface(null)
             }
         })
+    }
+
+    override fun onStart() {
+        super.onStart()
+        receiverForeground = true
+        if (receiverNeedsRecreation) {
+            displayedMacs = emptyList()
+            server = createReceiver()
+            receiverNeedsRecreation = false
+        }
+        setStreamingLook(false)
         server.start()
         mainHandler.post(checkStreamDelivery)
         mainHandler.post(updateCaptions)
+        android.util.Log.i("FireTVLifecycle", "Receiver foreground generation=$receiverGeneration")
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        android.util.Log.i("FireTVLifecycle", "Reusing receiver Activity generation=$receiverGeneration")
+    }
+
+    override fun onStop() {
+        receiverForeground = false
+        receiverNeedsRecreation = true
+        synchronized(receiverCallbackLock) { receiverGeneration++ }
+        server.stop()
+        mediaPlayer.reset()
+        setRemoteControlsActive(false)
+        incomingCaption.set(null)
+        captionTimeline.clear()
+        captionView.present(null)
+        captionView.visibility = View.INVISIBLE
+        statusDotPulse?.cancel()
+        mainHandler.removeCallbacks(hideFeedback)
+        mainHandler.removeCallbacks(checkStreamDelivery)
+        mainHandler.removeCallbacks(updateCaptions)
+        feedbackView.visibility = View.GONE
+        android.util.Log.i("FireTVLifecycle", "Receiver background; network session released")
+        super.onStop()
     }
 
     override fun onDestroy() {
+        synchronized(receiverCallbackLock) { receiverGeneration++ }
         captionEditor?.dismiss()
         statusDotPulse?.cancel()
         mainHandler.removeCallbacks(hideFeedback)
@@ -138,12 +223,40 @@ class MainActivity : Activity(), PairingServer.Listener {
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (remoteControlsActive && event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0 &&
-            event.keyCode in REMOTE_MEDIA_KEY_CODES
+            RemoteMediaCommand.forKey(event.keyCode) != null
         ) {
-            sendPlayPauseToMac()
+            sendRemoteKey(event.keyCode)
             return true
         }
         return super.dispatchKeyEvent(event)
+    }
+
+    override fun onMacsChanged(macs: List<MacServer>) = runOnUiThread {
+        if (isDestroyed || macs == displayedMacs) return@runOnUiThread
+        val focusedID = macList.findFocus()?.tag
+        displayedMacs = macs
+        macList.removeAllViews()
+        if (macs.isEmpty()) {
+            macList.addView(label(18f, Color.rgb(151, 165, 184)).apply { text = "Looking for Macs…" })
+        }
+        macs.forEach { mac ->
+            val button = actionButton("Connect to ${mac.name}${if (mac.trusted) " · Paired" else ""}${if (!mac.available) " · Offline" else ""}") {
+                server.connect(mac.id)
+            }.apply {
+                tag = mac.id
+                isEnabled = mac.available
+            }
+            button.isAllCaps = false
+            button.textSize = 18f
+            button.maxLines = 2
+            button.ellipsize = android.text.TextUtils.TruncateAt.END
+            macList.addView(button, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dip(8)
+            })
+            if (focusedID == mac.id) button.requestFocus()
+        }
+        if (focusedID == null && !streamingActive) macList.getChildAt(0)?.requestFocus()
     }
 
     override fun onPairingCode(code: String) = runOnUiThread {
@@ -153,9 +266,9 @@ class MainActivity : Activity(), PairingServer.Listener {
     override fun onPairingRequest(deviceName: String?) = runOnUiThread {
         requestProgress.visibility = View.VISIBLE
         statusView.text = if (deviceName == null) {
-            "Someone is requesting to join…"
+            "Authenticating with the Mac…"
         } else {
-            "$deviceName is requesting to join…"
+            "Authenticating with $deviceName…"
         }
     }
 
@@ -203,14 +316,16 @@ class MainActivity : Activity(), PairingServer.Listener {
     }
 
     override fun onMediaEnded() {
+        val generation = receiverGeneration
         incomingCaption.set(null)
         runOnUiThread {
+            if (generation != receiverGeneration) return@runOnUiThread
             captionTimeline.clear()
             captionView.present(null)
             captionView.visibility = View.INVISIBLE
         }
         mediaPlayer.reset()
-        runOnUiThread { setRemoteControlsActive(false) }
+        runOnUiThread { if (generation == receiverGeneration) setRemoteControlsActive(false) }
     }
 
     private fun buildInterface() {
@@ -298,106 +413,104 @@ class MainActivity : Activity(), PairingServer.Listener {
 
         pairingPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            setPadding(dip(32), dip(24), dip(32), dip(24))
         }
-
-        val title = label(26f, Color.WHITE).apply {
-            text = "iOS Screen Receiver"
-            letterSpacing = 0.04f
+        val title = label(28f, Color.WHITE).apply {
+            text = "Connect to your Mac"
             setTypeface(typeface, Typeface.BOLD)
+        }
+        instructionsView = label(16f, Color.rgb(151, 165, 184)).apply {
+            text = "Choose a Mac to mirror its display and audio."
+            setPadding(0, dip(6), 0, dip(12))
         }
         statusDot = View(this).apply {
             background = circle(Color.rgb(240, 180, 60))
         }
-        statusView = label(24f, Color.rgb(151, 165, 184)).apply {
-            text = "Starting receiver…"
+        statusView = label(16f, Color.rgb(151, 165, 184)).apply {
+            text = "Looking for Macs…"
+            maxLines = 2
+            maxWidth = dip(700)
+            ellipsize = android.text.TextUtils.TruncateAt.END
+        }
+        requestProgress = ProgressBar(this).apply {
+            isIndeterminate = true
+            visibility = View.INVISIBLE
         }
         val statusRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            addView(
-                statusDot,
-                LinearLayout.LayoutParams(dip(12), dip(12)).apply {
-                    setMargins(0, 0, dip(12), 0)
-                },
-            )
-            addView(statusView)
+            addView(statusDot, LinearLayout.LayoutParams(dip(8), dip(8)).apply {
+                marginEnd = dip(10)
+            })
+            addView(statusView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            addView(requestProgress, LinearLayout.LayoutParams(dip(18), dip(18)))
         }
-        requestProgress = ProgressBar(this).apply {
-            isIndeterminate = true
-            // Keep the status block's height stable while authentication starts.
-            // A GONE spinner made the pairing content jump down when it appeared.
-            visibility = View.INVISIBLE
+        pairingPanel.addView(title)
+        pairingPanel.addView(instructionsView)
+        pairingPanel.addView(statusRow, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            gravity = Gravity.CENTER_HORIZONTAL
+        })
+
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
         }
-        codeView = label(72f, Color.WHITE).apply {
-            typeface = Typeface.MONOSPACE
-            setTypeface(typeface, Typeface.BOLD)
-            letterSpacing = 0.14f
-            setPadding(0, dip(14), 0, dip(10))
-        }
-        val codeCard = LinearLayout(this).apply {
+        val macCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            setPadding(dip(56), dip(26), dip(56), dip(22))
-            background = rounded(dipf(28), Color.rgb(17, 22, 31)).apply {
+            setPadding(dip(20), dip(18), dip(20), dip(18))
+            background = rounded(dipf(20), Color.rgb(17, 22, 31)).apply {
                 setStroke(dip(1), Color.rgb(44, 52, 68))
             }
-            addView(
-                label(14f, Color.rgb(110, 168, 254)).apply {
-                    text = "PAIRING CODE"
-                    letterSpacing = 0.3f
-                    setTypeface(typeface, Typeface.BOLD)
-                },
-            )
-            addView(codeView)
         }
-        instructionsView = label(20f, Color.rgb(151, 165, 184)).apply {
-            text = "Select this receiver on your iPhone or Mac.\nEnter the code the first time; this device will be remembered."
-            gravity = Gravity.CENTER
-            setLineSpacing(dip(4).toFloat(), 1f)
+        macCard.addView(label(16f, Color.rgb(151, 165, 184)).apply {
+            text = "AVAILABLE MACS"
+            setPadding(0, 0, 0, dip(12))
+        })
+        macList = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
         }
+        val macScroll = android.widget.ScrollView(this).apply {
+            isFillViewport = false
+            addView(macList)
+        }
+        macCard.addView(macScroll, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        body.addView(macCard, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f).apply {
+            marginEnd = dip(18)
+        })
 
-        pairingPanel.addView(
-            title,
-            LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-            ).apply {
-                setMargins(0, 0, 0, dip(14))
-            },
-        )
-        pairingPanel.addView(statusRow)
-        pairingPanel.addView(
-            requestProgress,
-            LinearLayout.LayoutParams(dip(40), dip(40)).apply {
-                gravity = Gravity.CENTER_HORIZONTAL
-                setMargins(0, dip(16), 0, 0)
-            },
-        )
-        pairingPanel.addView(
-            codeCard,
-            LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-            ).apply {
-                gravity = Gravity.CENTER_HORIZONTAL
-                setMargins(0, dip(22), 0, dip(22))
-            },
-        )
-        pairingPanel.addView(instructionsView)
-        root.addView(
-            pairingPanel,
-            FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.CENTER,
-            ).apply {
-                // Reserve the lower band for the remote controls. Without this,
-                // the instructions sit underneath the tray on a 1080p TV.
-                bottomMargin = dip(40)
-            },
-        )
+        val codeCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dip(20), dip(18), dip(20), dip(18))
+            background = rounded(dipf(20), Color.rgb(17, 22, 31)).apply {
+                setStroke(dip(1), Color.rgb(44, 52, 68))
+            }
+        }
+        codeCard.addView(label(18f, Color.WHITE).apply {
+            text = "First-time pairing"
+            setTypeface(typeface, Typeface.BOLD)
+        })
+        codeCard.addView(label(15f, Color.rgb(151, 165, 184)).apply {
+            text = "Enter this code in your Mac’s pairing window, then choose Connect here."
+            setPadding(0, dip(12), 0, dip(10))
+        })
+        codeView = label(32f, Color.rgb(110, 168, 254)).apply {
+            typeface = Typeface.MONOSPACE
+            letterSpacing = 0.06f
+            setTypeface(typeface, Typeface.BOLD)
+            isSingleLine = true
+        }
+        codeCard.addView(codeView)
+        codeCard.addView(label(14f, Color.rgb(151, 165, 184)).apply {
+            text = "Paired Macs connect without a code."
+            setPadding(0, dip(10), 0, 0)
+        })
+        body.addView(codeCard, LinearLayout.LayoutParams(dip(260), ViewGroup.LayoutParams.MATCH_PARENT))
+        pairingPanel.addView(body, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f).apply { topMargin = dip(18) })
+        root.addView(pairingPanel, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT).apply {
+            setMargins(dip(36), dip(28), dip(36), dip(100))
+        })
 
         resetHint = label(16f, Color.rgb(151, 165, 184)).apply {
             text = "☰  Menu  ·  Reset session and show controls"
@@ -427,19 +540,43 @@ class MainActivity : Activity(), PairingServer.Listener {
                 setStroke(dip(1), Color.argb(110, 58, 68, 88))
             }
         }
-        val hideButton = actionButton("Hide controls") {
+        val hideButton = actionButton("Hide") {
             setControlsVisible(visible = false)
             showFeedback("Controls hidden  ·  Press BACK to show")
         }
-        val resetButton = actionButton("Reset session") {
-            mediaPlayer.reset()
-            server.reset()
-        }
-        val restartButton = actionButton("Restart receiver") { restartReceiver() }
         controlsPanel.addView(hideButton)
         controlsPanel.addView(actionButton("Captions") { showCaptionEditor() })
-        controlsPanel.addView(resetButton)
-        controlsPanel.addView(restartButton)
+        controlsPanel.addView(actionButton("Disconnect") { server.disconnect() })
+        val moreButton = actionButton("More") {}
+        moreButton.setOnClickListener {
+            android.widget.PopupMenu(this, moreButton).apply {
+                menu.add("Back 10 seconds").setOnMenuItemClickListener {
+                    sendSeekToMac(RemoteMediaCommand.BACKWARD_10)
+                    true
+                }
+                menu.add("Forward 10 seconds").setOnMenuItemClickListener {
+                    sendSeekToMac(RemoteMediaCommand.FORWARD_10)
+                    true
+                }
+                menu.add("Reset session").setOnMenuItemClickListener {
+                    server.reset()
+                    true
+                }
+                menu.add("Restart receiver").setOnMenuItemClickListener {
+                    restartReceiver()
+                    true
+                }
+                show()
+            }
+        }
+        controlsPanel.addView(moreButton)
+        for (index in 0 until controlsPanel.childCount) {
+            (controlsPanel.getChildAt(index) as? Button)?.apply {
+                textSize = 15f
+                setPadding(dip(20), dip(12), dip(20), dip(12))
+                isSingleLine = true
+            }
+        }
         root.addView(
             controlsPanel,
             FrameLayout.LayoutParams(
@@ -562,6 +699,7 @@ class MainActivity : Activity(), PairingServer.Listener {
 
     /** Restarts networking and media without killing the Android process. */
     private fun restartReceiver() {
+        val generation = synchronized(receiverCallbackLock) { ++receiverGeneration }
         statusView.text = "Restarting receiver…"
         requestProgress.visibility = View.VISIBLE
         mediaPlayer.reset()
@@ -569,8 +707,9 @@ class MainActivity : Activity(), PairingServer.Listener {
         server.stop()
         setControlsVisible(visible = false)
         mainHandler.postDelayed({
-            if (isFinishing || isDestroyed) return@postDelayed
-            server = PairingServer(applicationContext, this)
+            if (isFinishing || isDestroyed || !receiverForeground || generation != receiverGeneration) return@postDelayed
+            displayedMacs = emptyList()
+            server = createReceiver()
             server.start()
         }, 400)
     }
@@ -665,6 +804,8 @@ class MainActivity : Activity(), PairingServer.Listener {
                 object : MediaSession.Callback() {
                     override fun onPlay() = sendPlayPauseToMac()
                     override fun onPause() = sendPlayPauseToMac()
+                    override fun onFastForward() = sendSeekToMac(RemoteMediaCommand.FORWARD_10)
+                    override fun onRewind() = sendSeekToMac(RemoteMediaCommand.BACKWARD_10)
 
                     @Suppress("DEPRECATION")
                     override fun onMediaButtonEvent(mediaButtonIntent: Intent): Boolean {
@@ -672,9 +813,9 @@ class MainActivity : Activity(), PairingServer.Listener {
                             Intent.EXTRA_KEY_EVENT
                         ) ?: return false
                         if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0 &&
-                            event.keyCode in REMOTE_MEDIA_KEY_CODES
+                            RemoteMediaCommand.forKey(event.keyCode) != null
                         ) {
-                            sendPlayPauseToMac()
+                            sendRemoteKey(event.keyCode)
                             return true
                         }
                         return super.onMediaButtonEvent(mediaButtonIntent)
@@ -688,6 +829,7 @@ class MainActivity : Activity(), PairingServer.Listener {
 
     private fun setRemoteControlsActive(active: Boolean) {
         remoteControlsActive = active
+        if (!active) { pendingSeekID = null; pendingSeekCommand = null }
         if (active) {
             remotePlaybackIsPlaying = true
             updateRemotePlaybackState(playing = true)
@@ -700,9 +842,53 @@ class MainActivity : Activity(), PairingServer.Listener {
         val now = SystemClock.elapsedRealtime()
         if (now - lastRemoteCommandTime < REMOTE_COMMAND_DEBOUNCE_MILLISECONDS) return
         lastRemoteCommandTime = now
-        server.sendRemoteMediaCommand(REMOTE_COMMAND_TOGGLE_PLAY_PAUSE)
+        if (!server.sendRemoteMediaCommand(RemoteMediaCommand.TOGGLE)) {
+            showFeedback("Mac controls unavailable")
+            return
+        }
         updateRemotePlaybackState(playing = !remotePlaybackIsPlaying)
         showFeedback(if (remotePlaybackIsPlaying) "▶  Playing" else "‖  Paused")
+    }
+
+    private fun sendRemoteKey(keyCode: Int) {
+        when (val command = RemoteMediaCommand.forKey(keyCode)) {
+            RemoteMediaCommand.TOGGLE -> sendPlayPauseToMac()
+            RemoteMediaCommand.FORWARD_10, RemoteMediaCommand.BACKWARD_10 -> sendSeekToMac(command)
+        }
+    }
+
+    private fun sendSeekToMac(command: String) {
+        if (!remoteControlsActive) { showFeedback("Connect to a Mac first"); return }
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastRemoteCommandTime < REMOTE_COMMAND_DEBOUNCE_MILLISECONDS) return
+        val requestID = java.util.UUID.randomUUID().toString()
+        if (!server.sendRemoteMediaCommand(command, requestID)) {
+            showFeedback("Seeking unavailable — update or reconnect your Mac")
+            return
+        }
+        lastRemoteCommandTime = now
+        pendingSeekID = requestID
+        pendingSeekCommand = command
+        showFeedback(if (command == RemoteMediaCommand.FORWARD_10) "Seeking +10 seconds…" else "Seeking −10 seconds…")
+        val generation = receiverGeneration
+        mainHandler.postDelayed({
+            if (generation == receiverGeneration && pendingSeekID == requestID) {
+                pendingSeekID = null
+                pendingSeekCommand = null
+                showFeedback("Mac player did not respond")
+            }
+        }, 5_000)
+    }
+
+    override fun onRemoteSeekResult(requestID: String, command: String, status: String) = runOnUiThread {
+        if (!remoteControlsActive || pendingSeekID != requestID || pendingSeekCommand != command) return@runOnUiThread
+        pendingSeekID = null
+        pendingSeekCommand = null
+        showFeedback(when (status) {
+            "sent" -> if (command == RemoteMediaCommand.FORWARD_10) "+10 seconds" else "−10 seconds"
+            "busy" -> "Player busy — try again"
+            else -> "No seekable player on your Mac"
+        })
     }
 
     private fun updateRemotePlaybackState(playing: Boolean) {
@@ -712,7 +898,8 @@ class MainActivity : Activity(), PairingServer.Listener {
                 .setActions(
                     PlaybackState.ACTION_PLAY or
                         PlaybackState.ACTION_PAUSE or
-                        PlaybackState.ACTION_PLAY_PAUSE
+                        PlaybackState.ACTION_PLAY_PAUSE or
+                        PlaybackState.ACTION_FAST_FORWARD or PlaybackState.ACTION_REWIND
                 )
                 .setState(
                     if (playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED,
@@ -724,14 +911,7 @@ class MainActivity : Activity(), PairingServer.Listener {
     }
 
     private companion object {
-        const val REMOTE_COMMAND_TOGGLE_PLAY_PAUSE = "toggle_play_pause"
         const val REMOTE_COMMAND_DEBOUNCE_MILLISECONDS = 250L
         const val STREAM_HEALTH_POLL_MILLISECONDS = 250L
-        val REMOTE_MEDIA_KEY_CODES = setOf(
-            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
-            KeyEvent.KEYCODE_MEDIA_PLAY,
-            KeyEvent.KEYCODE_MEDIA_PAUSE,
-            KeyEvent.KEYCODE_HEADSETHOOK,
-        )
     }
 }

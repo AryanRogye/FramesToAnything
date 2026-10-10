@@ -6,7 +6,7 @@ import SnapCore
 /// Receiver buffer reports and the existing bitrate/quality adjustment policy.
 /// This extension uses the same transport state and queues; it creates no new pipeline.
 extension MacFireTVTransport {
-    func configureVideo(maximumQuality: MacStreamQuality) {
+    nonisolated func configureVideo(maximumQuality: MacStreamQuality) {
         networkQueue.async { [weak self] in
             guard let self else { return }
             qualityLadder = CinemaQualityLevel.ladder(maximum: maximumQuality)
@@ -17,7 +17,7 @@ extension MacFireTVTransport {
         }
     }
 
-    func handleReceiverReport(_ object: [String: Any]) {
+    nonisolated func handleReceiverReport(_ object: [String: Any]) {
         guard receiverFeatures.contains(Self.receiverReportsFeature) else { return }
         let videoBuffer = object["videoBufferMs"] as? Int ?? 0
         let audioBuffer = object["audioBufferMs"] as? Int ?? 0
@@ -64,7 +64,7 @@ extension MacFireTVTransport {
         lastRecoveries = recoveries
     }
 
-    func stepQualityDown(now: ContinuousClock.Instant) {
+    nonisolated func stepQualityDown(now: ContinuousClock.Instant) {
         guard lastQualityChange.duration(to: now) >= .seconds(2),
               qualityLevelIndex + 1 < qualityLadder.count else { return }
         qualityLevelIndex += 1
@@ -72,7 +72,7 @@ extension MacFireTVTransport {
         applyCurrentQuality()
     }
 
-    func stepQualityUp(now: ContinuousClock.Instant) {
+    nonisolated func stepQualityUp(now: ContinuousClock.Instant) {
         guard lastQualityChange.duration(to: now) >= .seconds(20),
               qualityLevelIndex > 0 else { return }
         qualityLevelIndex -= 1
@@ -80,7 +80,7 @@ extension MacFireTVTransport {
         applyCurrentQuality()
     }
 
-    func applyCurrentQuality(force: Bool = false) {
+    nonisolated func applyCurrentQuality(force: Bool = false) {
         guard qualityLadder.indices.contains(qualityLevelIndex) else { return }
         let level = qualityLadder[qualityLevelIndex]
         macTransportLogger.info("Adaptive quality index=\(self.qualityLevelIndex) bitrate=\(level.averageBitRate)")
@@ -91,8 +91,12 @@ extension MacFireTVTransport {
                 keyFrameInterval: 30
             )
         )
+        let generation = currentMediaGeneration()
         let callback = onAdaptiveQualityChanged
-        Task { @MainActor in callback?(level.quality, level.averageBitRate) }
+        Task { @MainActor [weak self] in
+            guard let self, currentMediaGeneration() == generation else { return }
+            callback?(level.quality, level.averageBitRate)
+        }
         if force { lastQualityChange = .now }
     }
 

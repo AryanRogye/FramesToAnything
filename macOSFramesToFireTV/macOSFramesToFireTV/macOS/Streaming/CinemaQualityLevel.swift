@@ -1,7 +1,7 @@
 #if os(macOS)
 import Foundation
 
-struct CinemaQualityLevel: Equatable {
+nonisolated struct CinemaQualityLevel: Equatable {
     let quality: MacStreamQuality
     let averageBitRate: Int
 

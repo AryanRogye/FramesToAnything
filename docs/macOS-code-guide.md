@@ -25,7 +25,7 @@ All feature code lives under `macOSFramesToFireTV/macOSFramesToFireTV/macOS/`.
 | `UI` | `MacMenuBarContent.swift`: menu controls. `MacPairingView.swift`: pairing window and its window identifier. |
 | `Streaming` | `MacStreamingModel.swift`: capture/session coordination. `MacStreamQuality.swift`: user-facing quality choices. `CinemaQualityLevel.swift`: adaptive bitrate ladder. `ReceiverBufferPolicy.swift`: buffer health classification. `CinemaAACEncoder.swift`: PCM-to-AAC conversion and its converter callback. |
 | `Transport` | `MacFireTVTransport.swift`: shared state, encoder setup, session cleanup, frame admission, and protocol limits. `MacFireTVDevice.swift`: receiver identity and connection-state presentation. `Data+WireEncoding.swift`: big-endian wire encoding. `MacMediaKeyController.swift`: remote play/pause key injection. |
-| `Transport` extensions | `+Discovery.swift`: browsing and connection setup. `+Pairing.swift`: incoming JSON, authentication, trust, and commands. `+Media.swift`: video/audio/caption entry points, packet encryption, and network writes. `+AdaptiveQuality.swift`: receiver reports and quality changes. |
+| `Transport` extensions | `+Discovery.swift`: persistent server, receiver browsing, scoped pairing, and listener retry. `+Pairing.swift`: incoming JSON, authentication, trust, and commands. `+Media.swift`: video/audio/caption entry points, packet encryption, and network writes. `+AdaptiveQuality.swift`: receiver reports and quality changes. |
 | `Captions` | `LiveCaptionExperiment.swift`: WhisperKit loading/inference lifecycle. `CaptionMode.swift`: language/task/model choices. `CaptionAudioTap.swift`: bounded audio admission and 16 kHz conversion. `CaptionAudioWindow.swift`: rolling inference input. `CaptionRevisionState.swift`: committed text, partial revisions, and outgoing cue format. |
 | `Security` | `TrustedReceiverStore.swift`: remembered receiver secrets and service-name associations. `ReceiverControlAuthentication.swift`: authenticated control-message validation. |
 
@@ -62,6 +62,29 @@ while waiting for Whisper.
 `CaptionRevisionState`, and emits cues through `transport.sendCaption`. Caption
 packets share the encrypted connection, but have a single pending slot rather
 than an accumulating subtitle backlog. The receiver renders them over video.
+
+## Connection lifecycle
+
+The model starts the Mac TCP server at launch. Its `_framesmac._tcp`
+advertisement persists through authentication, streaming, and disconnects.
+Fire TV chooses a Mac and opens the socket. Incoming `hello.receiverID` selects
+saved trust; the ID alone never authorizes streaming. Untrusted receivers require
+a code authorization scoped to that receiver and expiring after two minutes.
+
+`Connection/ConnectionSessionPolicy.swift` owns handshake transitions and session
+generations. Authentication has a fifteen-second deadline. Media enqueue and
+write completion check session ownership; failed/stalled sessions release their
+socket without destroying the listener. Optional heartbeat records are encrypted,
+receiver responses are authenticated, and twelve-second liveness/write deadlines
+recover silent failures. Listener failures recreate the listener with bounded retry.
+
+Capture startup/cleanup is serialized on the main actor. A replacement session
+waits for preceding capture shutdown; generation checks reject old frame callbacks.
+Adaptive capture restarts preserve the existing bitrate ladder and caption worker;
+quality changes during startup replace the pending capture scale.
+Trusted authentication automatically starts the main display. Optional display
+selection retains a cached selection within the process. Mac Stop pauses incoming
+sessions; Fire TV Disconnect cancels its retry intent.
 
 ## Concurrency rules to preserve
 

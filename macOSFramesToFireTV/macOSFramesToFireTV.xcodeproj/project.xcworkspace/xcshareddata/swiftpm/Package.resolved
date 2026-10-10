@@ -1,6 +1,14 @@
 {
-  "originHash" : "fd3ba078f4f0f0f06f0d449e17eae3a13edfd510875ccbe85daf71dd8721343f",
+  "originHash" : "734139751eb916e512298e50e252f248d847747cbd4b7e0a4f198cb159a4a7de",
   "pins" : [
+    {
+      "identity" : "mediaremote-adapter",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/ejbills/mediaremote-adapter.git",
+      "state" : {
+        "revision" : "5b6afde3f501a3da567e23bf7f23d562938a1809"
+      }
+    },
     {
       "identity" : "snapcore",
       "kind" : "remoteSourceControl",

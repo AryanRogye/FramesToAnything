@@ -218,11 +218,31 @@ extension MacFireTVTransport {
         case "remote_media_command":
             guard currentStreamingKey() != nil,
                   receiverFeatures.contains(Self.remoteMediaControlsFeature),
-                  object["command"] as? String == "toggle_play_pause" else { return }
-            let now = ContinuousClock.now
-            guard lastRemoteMediaCommand.duration(to: now) >= .milliseconds(200) else { return }
-            lastRemoteMediaCommand = now
-            MacMediaKeyController.togglePlayPause()
+                  let value = object["command"] as? String,
+                  let command = RemoteMediaCommand(rawValue: value) else { return }
+            if command.seekOffset != nil {
+                guard receiverFeatures.contains(Self.remoteSeekFeature),
+                      let requestID = object["requestID"] as? String,
+                      UUID(uuidString: requestID) != nil else { return }
+                let now = ContinuousClock.now
+                guard lastRemoteMediaCommand.duration(to: now) >= .milliseconds(200) else { return }
+                lastRemoteMediaCommand = now
+                let generation = currentMediaGeneration()
+                Task { @MainActor [weak self] in
+                    guard let self, currentMediaGeneration() == generation else { return }
+                    MacRemoteSeekController.shared.seek(command: command, isCurrent: { [weak self] in
+                        self?.currentMediaGeneration() == generation
+                    }, completion: { [weak self] status in
+                        self?.sendRemoteSeekResult(requestID: requestID, command: command,
+                                                   status: status, generation: generation)
+                    })
+                }
+            } else {
+                let now = ContinuousClock.now
+                guard lastRemoteMediaCommand.duration(to: now) >= .milliseconds(200) else { return }
+                lastRemoteMediaCommand = now
+                MacMediaKeyController.togglePlayPause()
+            }
 
         default:
             break

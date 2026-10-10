@@ -28,6 +28,8 @@ import android.widget.TextView
 class MainActivity : Activity(), PairingServer.Listener {
     private val receiverCallbackLock = Any()
     @Volatile private var receiverGeneration = 0L
+    private var receiverForeground = false
+    private var receiverNeedsRecreation = false
     private lateinit var server: PairingServer
     private lateinit var surfaceView: SurfaceView
     private lateinit var mediaPlayer: FireTVMediaPlayer
@@ -65,6 +67,8 @@ class MainActivity : Activity(), PairingServer.Listener {
     private var remoteControlsActive = false
     private var remotePlaybackIsPlaying = true
     private var lastRemoteCommandTime = 0L
+    private var pendingSeekID: String? = null
+    private var pendingSeekCommand: String? = null
     private var pairingPanelVisible = true
     private var streamingActive = false
     private var statusDotPulse: ValueAnimator? = null
@@ -111,6 +115,9 @@ class MainActivity : Activity(), PairingServer.Listener {
             override fun onCaption(id: String, revision: Long, startMs: Long, endMs: Long, text: String, final: Boolean, committedText: String?, partialText: String?) {
                 media { this@MainActivity.onCaption(id, revision, startMs, endMs, text, final, committedText, partialText) }
             }
+            override fun onRemoteSeekResult(requestID: String, command: String, status: String) {
+                ui { this@MainActivity.onRemoteSeekResult(requestID, command, status) }
+            }
             override fun onMediaEnded() {
                 media { this@MainActivity.onMediaEnded() }
             }
@@ -143,9 +150,47 @@ class MainActivity : Activity(), PairingServer.Listener {
                 mediaPlayer.setSurface(null)
             }
         })
+    }
+
+    override fun onStart() {
+        super.onStart()
+        receiverForeground = true
+        if (receiverNeedsRecreation) {
+            displayedMacs = emptyList()
+            server = createReceiver()
+            receiverNeedsRecreation = false
+        }
+        setStreamingLook(false)
         server.start()
         mainHandler.post(checkStreamDelivery)
         mainHandler.post(updateCaptions)
+        android.util.Log.i("FireTVLifecycle", "Receiver foreground generation=$receiverGeneration")
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        android.util.Log.i("FireTVLifecycle", "Reusing receiver Activity generation=$receiverGeneration")
+    }
+
+    override fun onStop() {
+        receiverForeground = false
+        receiverNeedsRecreation = true
+        synchronized(receiverCallbackLock) { receiverGeneration++ }
+        server.stop()
+        mediaPlayer.reset()
+        setRemoteControlsActive(false)
+        incomingCaption.set(null)
+        captionTimeline.clear()
+        captionView.present(null)
+        captionView.visibility = View.INVISIBLE
+        statusDotPulse?.cancel()
+        mainHandler.removeCallbacks(hideFeedback)
+        mainHandler.removeCallbacks(checkStreamDelivery)
+        mainHandler.removeCallbacks(updateCaptions)
+        feedbackView.visibility = View.GONE
+        android.util.Log.i("FireTVLifecycle", "Receiver background; network session released")
+        super.onStop()
     }
 
     override fun onDestroy() {
@@ -178,9 +223,9 @@ class MainActivity : Activity(), PairingServer.Listener {
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (remoteControlsActive && event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0 &&
-            event.keyCode in REMOTE_MEDIA_KEY_CODES
+            RemoteMediaCommand.forKey(event.keyCode) != null
         ) {
-            sendPlayPauseToMac()
+            sendRemoteKey(event.keyCode)
             return true
         }
         return super.dispatchKeyEvent(event)
@@ -505,6 +550,14 @@ class MainActivity : Activity(), PairingServer.Listener {
         val moreButton = actionButton("More") {}
         moreButton.setOnClickListener {
             android.widget.PopupMenu(this, moreButton).apply {
+                menu.add("Back 10 seconds").setOnMenuItemClickListener {
+                    sendSeekToMac(RemoteMediaCommand.BACKWARD_10)
+                    true
+                }
+                menu.add("Forward 10 seconds").setOnMenuItemClickListener {
+                    sendSeekToMac(RemoteMediaCommand.FORWARD_10)
+                    true
+                }
                 menu.add("Reset session").setOnMenuItemClickListener {
                     server.reset()
                     true
@@ -646,7 +699,7 @@ class MainActivity : Activity(), PairingServer.Listener {
 
     /** Restarts networking and media without killing the Android process. */
     private fun restartReceiver() {
-        synchronized(receiverCallbackLock) { receiverGeneration++ }
+        val generation = synchronized(receiverCallbackLock) { ++receiverGeneration }
         statusView.text = "Restarting receiver…"
         requestProgress.visibility = View.VISIBLE
         mediaPlayer.reset()
@@ -654,7 +707,7 @@ class MainActivity : Activity(), PairingServer.Listener {
         server.stop()
         setControlsVisible(visible = false)
         mainHandler.postDelayed({
-            if (isFinishing || isDestroyed) return@postDelayed
+            if (isFinishing || isDestroyed || !receiverForeground || generation != receiverGeneration) return@postDelayed
             displayedMacs = emptyList()
             server = createReceiver()
             server.start()
@@ -751,6 +804,8 @@ class MainActivity : Activity(), PairingServer.Listener {
                 object : MediaSession.Callback() {
                     override fun onPlay() = sendPlayPauseToMac()
                     override fun onPause() = sendPlayPauseToMac()
+                    override fun onFastForward() = sendSeekToMac(RemoteMediaCommand.FORWARD_10)
+                    override fun onRewind() = sendSeekToMac(RemoteMediaCommand.BACKWARD_10)
 
                     @Suppress("DEPRECATION")
                     override fun onMediaButtonEvent(mediaButtonIntent: Intent): Boolean {
@@ -758,9 +813,9 @@ class MainActivity : Activity(), PairingServer.Listener {
                             Intent.EXTRA_KEY_EVENT
                         ) ?: return false
                         if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0 &&
-                            event.keyCode in REMOTE_MEDIA_KEY_CODES
+                            RemoteMediaCommand.forKey(event.keyCode) != null
                         ) {
-                            sendPlayPauseToMac()
+                            sendRemoteKey(event.keyCode)
                             return true
                         }
                         return super.onMediaButtonEvent(mediaButtonIntent)
@@ -774,6 +829,7 @@ class MainActivity : Activity(), PairingServer.Listener {
 
     private fun setRemoteControlsActive(active: Boolean) {
         remoteControlsActive = active
+        if (!active) { pendingSeekID = null; pendingSeekCommand = null }
         if (active) {
             remotePlaybackIsPlaying = true
             updateRemotePlaybackState(playing = true)
@@ -786,9 +842,53 @@ class MainActivity : Activity(), PairingServer.Listener {
         val now = SystemClock.elapsedRealtime()
         if (now - lastRemoteCommandTime < REMOTE_COMMAND_DEBOUNCE_MILLISECONDS) return
         lastRemoteCommandTime = now
-        server.sendRemoteMediaCommand(REMOTE_COMMAND_TOGGLE_PLAY_PAUSE)
+        if (!server.sendRemoteMediaCommand(RemoteMediaCommand.TOGGLE)) {
+            showFeedback("Mac controls unavailable")
+            return
+        }
         updateRemotePlaybackState(playing = !remotePlaybackIsPlaying)
         showFeedback(if (remotePlaybackIsPlaying) "▶  Playing" else "‖  Paused")
+    }
+
+    private fun sendRemoteKey(keyCode: Int) {
+        when (val command = RemoteMediaCommand.forKey(keyCode)) {
+            RemoteMediaCommand.TOGGLE -> sendPlayPauseToMac()
+            RemoteMediaCommand.FORWARD_10, RemoteMediaCommand.BACKWARD_10 -> sendSeekToMac(command)
+        }
+    }
+
+    private fun sendSeekToMac(command: String) {
+        if (!remoteControlsActive) { showFeedback("Connect to a Mac first"); return }
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastRemoteCommandTime < REMOTE_COMMAND_DEBOUNCE_MILLISECONDS) return
+        val requestID = java.util.UUID.randomUUID().toString()
+        if (!server.sendRemoteMediaCommand(command, requestID)) {
+            showFeedback("Seeking unavailable — update or reconnect your Mac")
+            return
+        }
+        lastRemoteCommandTime = now
+        pendingSeekID = requestID
+        pendingSeekCommand = command
+        showFeedback(if (command == RemoteMediaCommand.FORWARD_10) "Seeking +10 seconds…" else "Seeking −10 seconds…")
+        val generation = receiverGeneration
+        mainHandler.postDelayed({
+            if (generation == receiverGeneration && pendingSeekID == requestID) {
+                pendingSeekID = null
+                pendingSeekCommand = null
+                showFeedback("Mac player did not respond")
+            }
+        }, 5_000)
+    }
+
+    override fun onRemoteSeekResult(requestID: String, command: String, status: String) = runOnUiThread {
+        if (!remoteControlsActive || pendingSeekID != requestID || pendingSeekCommand != command) return@runOnUiThread
+        pendingSeekID = null
+        pendingSeekCommand = null
+        showFeedback(when (status) {
+            "sent" -> if (command == RemoteMediaCommand.FORWARD_10) "+10 seconds" else "−10 seconds"
+            "busy" -> "Player busy — try again"
+            else -> "No seekable player on your Mac"
+        })
     }
 
     private fun updateRemotePlaybackState(playing: Boolean) {
@@ -798,7 +898,8 @@ class MainActivity : Activity(), PairingServer.Listener {
                 .setActions(
                     PlaybackState.ACTION_PLAY or
                         PlaybackState.ACTION_PAUSE or
-                        PlaybackState.ACTION_PLAY_PAUSE
+                        PlaybackState.ACTION_PLAY_PAUSE or
+                        PlaybackState.ACTION_FAST_FORWARD or PlaybackState.ACTION_REWIND
                 )
                 .setState(
                     if (playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED,
@@ -810,14 +911,7 @@ class MainActivity : Activity(), PairingServer.Listener {
     }
 
     private companion object {
-        const val REMOTE_COMMAND_TOGGLE_PLAY_PAUSE = "toggle_play_pause"
         const val REMOTE_COMMAND_DEBOUNCE_MILLISECONDS = 250L
         const val STREAM_HEALTH_POLL_MILLISECONDS = 250L
-        val REMOTE_MEDIA_KEY_CODES = setOf(
-            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
-            KeyEvent.KEYCODE_MEDIA_PLAY,
-            KeyEvent.KEYCODE_MEDIA_PAUSE,
-            KeyEvent.KEYCODE_HEADSETHOOK,
-        )
     }
 }

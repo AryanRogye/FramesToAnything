@@ -40,6 +40,7 @@ AES-256-GCM records, authenticated receiver controls, and playback pipeline.
 - [x] Hardware: Fire TV app and in-app restart retain trust.
 - [x] Hardware: silent Mac server stall recovers automatically.
 - [x] Hardware: caption cues reach Fire TV after recovery.
+- [x] Hardware: repeated launcher re-entry and Home/return keep one Activity and release hidden sessions (8 cycles).
 - [ ] Hardware: physical Wi-Fi loss, DHCP change, and system sleep/wake.
 - [ ] Hardware: first-time pairing with neither peer previously trusted.
 - [ ] Hardware: A/V sync, captions, controls, and adaptive quality through recovery.

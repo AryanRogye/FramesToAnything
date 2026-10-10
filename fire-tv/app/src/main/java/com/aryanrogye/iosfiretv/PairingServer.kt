@@ -57,6 +57,7 @@ class PairingServer(
         fun onAudioConfiguration(sampleRate: Int, channels: Int, encoding: Int, codecConfig: ByteArray)
         fun onAudioFrame(data: ByteArray, timestampMilliseconds: Long)
         fun onCaption(id: String, revision: Long, startMs: Long, endMs: Long, text: String, final: Boolean, committedText: String?, partialText: String?)
+        fun onRemoteSeekResult(requestID: String, command: String, status: String)
         fun onMediaEnded()
     }
 
@@ -216,6 +217,7 @@ class PairingServer(
                     .put(
                         "features",
                         JSONArray()
+                            .put(RemoteMediaCommand.SEEK_FEATURE)
                             .put(FEATURE_HEARTBEAT)
                             .put(FEATURE_LIVE_CAPTIONS)
                             .put(FEATURE_CINEMA_BUFFER)
@@ -419,6 +421,13 @@ class PairingServer(
                 "Invalid media packet"
             }
             val kind = plaintext[1].toInt()
+            if (kind == MEDIA_REMOTE_SEEK_RESULT && negotiatedFeatures.contains(RemoteMediaCommand.SEEK_FEATURE)) {
+                if (plaintext.size <= MEDIA_HEADER_BYTES + 1024) runCatching {
+                    val result = JSONObject(String(plaintext.copyOfRange(MEDIA_HEADER_BYTES, plaintext.size), Charsets.UTF_8))
+                    listener.onRemoteSeekResult(result.getString("requestID"), result.getString("command"), result.getString("status"))
+                }
+                continue
+            }
             if (kind == MEDIA_HEARTBEAT) continue
             if (kind == MEDIA_VIDEO_FRAME && !receivedVideo) {
                 receivedVideo = true
@@ -526,15 +535,18 @@ class PairingServer(
         enqueueControl(output, message)
     }
 
-    fun sendRemoteMediaCommand(command: String) {
-        if (!negotiatedFeatures.contains(FEATURE_REMOTE_MEDIA_CONTROLS)) return
-        if (command != REMOTE_COMMAND_TOGGLE_PLAY_PAUSE) return
-        val output = activeOutput ?: return
+    fun sendRemoteMediaCommand(command: String, requestID: String? = null): Boolean {
+        if (!negotiatedFeatures.contains(FEATURE_REMOTE_MEDIA_CONTROLS) ||
+            !RemoteMediaCommand.allowed(command, negotiatedFeatures.contains(RemoteMediaCommand.SEEK_FEATURE))) return false
+        if (RemoteMediaCommand.isSeek(command) && requestID == null) return false
+        val output = activeOutput ?: return false
         val message = JSONObject()
             .put("type", "remote_media_command")
             .put("version", 1)
             .put("command", command)
-        enqueueControl(output, message)
+        requestID?.let { message.put("requestID", it) }
+        Log.i(TAG, "remote media command=$command")
+        return enqueueControl(output, message)
     }
 
     private fun writeControl(output: DataOutputStream, message: JSONObject) {
@@ -801,12 +813,12 @@ class PairingServer(
         enqueueControl(output, JSONObject().put("type", "heartbeat"))
     }
 
-    private fun enqueueControl(output: DataOutputStream, message: JSONObject) {
-        if (!running.get() || !controlWritePending.compareAndSet(false, true)) return
+    private fun enqueueControl(output: DataOutputStream, message: JSONObject): Boolean {
+        if (!running.get() || !controlWritePending.compareAndSet(false, true)) return false
         val socket = clientSocket
         val deadline = try {
             coordinator.schedule({ runCatching { socket?.close() } }, 10, TimeUnit.SECONDS)
-        } catch (error: Exception) { controlWritePending.set(false); return }
+        } catch (error: Exception) { controlWritePending.set(false); return false }
         try {
             controlWriter.execute {
                 try {
@@ -818,7 +830,8 @@ class PairingServer(
                     controlWritePending.set(false)
                 }
             }
-        } catch (error: Exception) { deadline.cancel(false); controlWritePending.set(false) }
+        } catch (error: Exception) { deadline.cancel(false); controlWritePending.set(false); return false }
+        return true
     }
 
     private fun writeJson(output: DataOutputStream, json: JSONObject) {
@@ -929,6 +942,7 @@ class PairingServer(
         const val MEDIA_AUDIO_FRAME = 4
         const val MEDIA_CAPTION = 5
         const val MEDIA_HEARTBEAT = 6
+        const val MEDIA_REMOTE_SEEK_RESULT = 7
         const val FEATURE_HEARTBEAT = "connection-heartbeat-v1"
         const val FEATURE_LIVE_CAPTIONS = "live-captions-v1"
         const val AUDIO_PCM_16 = 1
@@ -946,6 +960,7 @@ class PairingServer(
         val SUPPORTED_FEATURES = setOf(
             ReceiverControlAuthentication.FEATURE,
             FEATURE_HEARTBEAT,
+            RemoteMediaCommand.SEEK_FEATURE,
             FEATURE_CINEMA_BUFFER,
             FEATURE_LIVE_CAPTIONS,
             FEATURE_RECEIVER_REPORTS,

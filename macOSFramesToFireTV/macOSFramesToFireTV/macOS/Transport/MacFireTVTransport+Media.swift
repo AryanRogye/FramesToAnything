@@ -86,6 +86,25 @@ extension MacFireTVTransport {
         }
     }
 
+    /// Optional command feedback shares the existing encrypted media connection.
+    nonisolated func sendRemoteSeekResult(requestID: String, command: RemoteMediaCommand,
+                                         status: String, generation: UInt64) {
+        networkQueue.async { [weak self] in
+            guard let self, currentMediaGeneration() == generation,
+                  receiverFeatures.contains(Self.remoteSeekFeature), let key = currentStreamingKey(),
+                  let payload = try? JSONSerialization.data(withJSONObject: [
+                    "requestID": requestID, "command": command.rawValue, "status": status
+                  ]) else { return }
+            var plaintext = Data([Self.mediaVersion, 7])
+            plaintext.appendBigEndian(UInt64(0))
+            plaintext.append(0)
+            plaintext.append(payload)
+            guard let encrypted = try? AES.GCM.seal(plaintext, using: key).combined else { return }
+            sendPacket(type: Self.encryptedMediaPacket, payload: encrypted, kind: .control,
+                       generation: generation)
+        }
+    }
+
     nonisolated func sendJSON(_ object: [String: Any]) {
         guard let payload = try? JSONSerialization.data(withJSONObject: object) else { return }
         sendPacket(type: Self.jsonPacket, payload: payload, kind: .control)

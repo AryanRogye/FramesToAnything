@@ -241,6 +241,7 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
     static let maximumEncoderFramesInFlight = 6
     static let receiverReportsFeature = "receiver-report-v1"
     static let aacFeature = "aac-lc-v1"
+    static let remoteSeekFeature = "remote-seek-v1"
     static let remoteMediaControlsFeature = "remote-media-controls-v1"
     static let cinemaFeatures: Set<String> = [
         ReceiverControlAuthentication.feature,
@@ -251,6 +252,7 @@ nonisolated final class MacFireTVTransport: @unchecked Sendable {
         "keyframe-request-v1",
         aacFeature,
         remoteMediaControlsFeature,
+        remoteSeekFeature,
     ]
 }
 #endif

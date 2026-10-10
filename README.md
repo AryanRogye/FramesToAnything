@@ -371,6 +371,7 @@ Media kinds:
 | `4` | PCM samples or one raw AAC-LC access unit |
 | `5` | Negotiated live-caption cue JSON |
 | `6` | Negotiated encrypted connection heartbeat |
+| `7` | Negotiated encrypted remote-seek feedback |
 
 The maximum framed media record is 8 MiB. JSON handshake records are limited to 64 KiB.
 
@@ -386,6 +387,29 @@ The first remote play/pause command may ask for macOS Accessibility permission.
 Grant it to the Mac sender so it can post the same system media-key event as a
 physical keyboard. Remote commands are accepted only from the currently
 authenticated receiver.
+
+### Seeking from the Fire TV remote
+
+With updated Mac and Fire TV apps, the physical rewind/fast-forward buttons
+seek the Mac's active Now Playing media by −10/+10 seconds. The same actions
+are available under **More**; D-pad navigation and the compact tray are unchanged.
+Play/pause keeps its existing system-media-key behavior.
+
+The Mac uses [ejbills/mediaremote-adapter](https://github.com/ejbills/mediaremote-adapter)
+(pinned to `5b6afde3f501a3da567e23bf7f23d562938a1809`) to get the current position
+and issue an absolute seek, clamped between zero and the media duration. This
+controls the source player, not the receiver's playback buffer. A seekable Now
+Playing timeline is required; live streams and players without position/duration
+report unavailable. The adapter uses Apple's private MediaRemote framework through
+its bundled Perl bridge, so compatibility depends on macOS and player support.
+The application sandbox remains enabled.
+
+`remote-seek-v1` is negotiated separately. Receiver commands `seek_forward_10`
+and `seek_backward_10` use the existing authenticated-control envelope and a UUID
+request ID. Mac replies use encrypted media kind `7` with that request ID, command,
+and status. Only fixed ±10-second commands are allowed; missing/nonfinite metadata,
+unknown commands, and stale-session results are rejected. The TV reports unavailable
+players and timeouts rather than claiming a successful seek without a response.
 
 ### Authenticated receiver controls
 

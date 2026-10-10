@@ -65,3 +65,58 @@ interrupts the Mac app and restarts both apps; it never clears credentials.
 - Prolonged high-motion lip-sync measurement, quality downgrades/restoration under
   real congestion, and system-media-key effects with macOS Accessibility permission.
   Playback safety tests passed; clock startup does not measure sound at the listener.
+
+## October 9: normal launcher re-entry regression
+
+The Fire TV task contained two live MainActivity instances. The older stopped
+Activity still owned an authenticated Mac session because networking only stopped
+in onDestroy. The visible instance started a second coordinator and retried a
+Mac whose single receiver slot was already occupied. Closing the duplicate screen
+exposed the original live stream immediately, confirming the ownership conflict.
+
+The receiver now uses singleTask launch mode. Networking starts in onStart and
+stops in onStop; returning from Home creates a fresh coordinator with the same
+saved trust. Generation checks also prevent a delayed in-app restart from starting
+a coordinator after the Activity backgrounds or resumes into a newer generation.
+Video/audio/caption playback resources and UI timers are reset on backgrounding.
+The Mac server and authentication/encryption protocol are unchanged.
+
+Validation:
+
+- Fire TV playback safety gate passed: 39 JVM tests, debug and release APK builds.
+- Installed the updated receiver without restarting or re-pairing the Mac.
+- Added `scripts/verify-fire-tv-lifecycle.py`: repeatedly connects, opens the launcher
+  twice while streaming, goes Home, and returns through the launcher.
+- Eight cycles passed on the physical TV.
+- Each cycle checks exactly one receiver Activity, unchanged TV and Mac process
+  IDs, trusted authentication and audio-clock startup, and a real TCP probe proving
+  the Mac accepts a new unauthenticated peer after the TV backgrounds.
+
+```sh
+python3 scripts/verify-fire-tv-lifecycle.py --serial FIRE_TV_IP:5555 --cycles 8
+```
+
+Unlike the earlier force-stop/restart tests, this exercises Android's retained
+Activity lifecycle and mixed explicit/launcher intents.
+
+## October 9: Fire TV ±10-second controls
+
+- Integrated the pinned ejbills MediaRemoteAdapter dynamic package, embedded and signed.
+  Existing SnapCore/WhisperKit versions and sandbox/network entitlements are unchanged.
+- Rewind/fast-forward keys and More-menu actions send separately negotiated fixed
+  seek commands through the authenticated control path. Replies use AES-GCM kind 7.
+- Mac Release build and deep bundle signature verification passed. Mac tests: 24 passed.
+- Fire TV safety gate: 41 tests passed; debug and release APKs built and the updated
+  receiver installed. The updated Mac app is installed in /Applications.
+- On the physical Fire TV, key 90 then key 89 changed ComfyPortal Graphics and Media's
+  actual Now Playing position by exactly +10.000 and −10.000 seconds. Playback state
+  was preserved. Observed command-to-position changes took 1.84 and 1.07 seconds.
+- Two additional launcher/Home-return cycles passed with the seek-enabled builds.
+- The receiver was also installed on the replacement TV at 192.168.68.87; saved trust
+  connected it to the Mac and the new More-menu seek actions were verified in its UI.
+- Tests cover clamping at start/end, missing/live/nonfinite media data, unsupported
+  offsets/commands, capability negotiation, key mapping, and unaffected D-pad keys.
+
+Player compatibility is not universal: the source must expose a seekable Now Playing
+position and duration. The helper requests a seek; whether a particular player honors
+it is up to that player. Existing play/pause behavior is retained.

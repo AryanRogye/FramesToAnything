@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		9B3E84E230853EE300CF5125 /* VirtualDisplayKit in Frameworks */ = {isa = PBXBuildFile; productRef = 9B3E84E130853EE300CF5125 /* VirtualDisplayKit */; };
 		9B4B6D7730284A01008101B9 /* SnapCore in Frameworks */ = {isa = PBXBuildFile; productRef = 9B4B6D7630284A01008101B9 /* SnapCore */; };
 		CA0000010000000000000001 /* WhisperKit in Frameworks */ = {isa = PBXBuildFile; productRef = CA0000010000000000000003 /* WhisperKit */; };
 		D10000010000000000000001 /* MediaRemoteAdapter in Frameworks */ = {isa = PBXBuildFile; productRef = D10000010000000000000003 /* MediaRemoteAdapter */; };
@@ -16,12 +17,12 @@
 /* Begin PBXCopyFilesBuildPhase section */
 		D10000010000000000000005 /* Embed Frameworks */ = {
 			isa = PBXCopyFilesBuildPhase;
-			buildActionMask = 2147483647;
 			dstPath = "";
-			dstSubfolderSpec = 10;
-			files = (D10000010000000000000004 /* MediaRemoteAdapter in Embed Frameworks */, );
+			dstSubfolder = Frameworks;
+			files = (
+				D10000010000000000000004 /* MediaRemoteAdapter in Embed Frameworks */,
+			);
 			name = "Embed Frameworks";
-			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXCopyFilesBuildPhase section */
 
@@ -56,6 +57,7 @@
 			files = (
 				9B4B6D7730284A01008101B9 /* SnapCore in Frameworks */,
 				CA0000010000000000000001 /* WhisperKit in Frameworks */,
+				9B3E84E230853EE300CF5125 /* VirtualDisplayKit in Frameworks */,
 				D10000010000000000000001 /* MediaRemoteAdapter in Frameworks */,
 			);
 		};
@@ -100,6 +102,7 @@
 				9B4B6D7630284A01008101B9 /* SnapCore */,
 				CA0000010000000000000003 /* WhisperKit */,
 				D10000010000000000000003 /* MediaRemoteAdapter */,
+				9B3E84E130853EE300CF5125 /* VirtualDisplayKit */,
 			);
 			productName = macOSFramesToFireTV;
 			productReference = 9BE567053021803000D33AE6 /* macOSFramesToFireTV.app */;
@@ -132,7 +135,8 @@
 			packageReferences = (
 				9B4B6D7530284A01008101B9 /* XCRemoteSwiftPackageReference "SnapCore" */,
 				CA0000010000000000000002 /* XCRemoteSwiftPackageReference "WhisperKit" */,
-				D10000010000000000000002 /* XCRemoteSwiftPackageReference "MediaRemoteAdapter" */,
+				D10000010000000000000002 /* XCRemoteSwiftPackageReference "mediaremote-adapter" */,
+				9B3E84E030853EE300CF5125 /* XCRemoteSwiftPackageReference "VirtualDisplayKit" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 9BE567063021803000D33AE6 /* Products */;
@@ -377,6 +381,14 @@
 /* End XCConfigurationList section */
 
 /* Begin XCRemoteSwiftPackageReference section */
+		9B3E84E030853EE300CF5125 /* XCRemoteSwiftPackageReference "VirtualDisplayKit" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/xocialize/VirtualDisplayKit";
+			requirement = {
+				branch = main;
+				kind = branch;
+			};
+		};
 		9B4B6D7530284A01008101B9 /* XCRemoteSwiftPackageReference "SnapCore" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/AryanRogye/SnapCore";
@@ -393,14 +405,22 @@
 				version = 1.0.0;
 			};
 		};
-		D10000010000000000000002 /* XCRemoteSwiftPackageReference "MediaRemoteAdapter" */ = {
+		D10000010000000000000002 /* XCRemoteSwiftPackageReference "mediaremote-adapter" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/ejbills/mediaremote-adapter.git";
-			requirement = { kind = revision; revision = 5b6afde3f501a3da567e23bf7f23d562938a1809; };
+			requirement = {
+				kind = revision;
+				revision = 5b6afde3f501a3da567e23bf7f23d562938a1809;
+			};
 		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
+		9B3E84E130853EE300CF5125 /* VirtualDisplayKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 9B3E84E030853EE300CF5125 /* XCRemoteSwiftPackageReference "VirtualDisplayKit" */;
+			productName = VirtualDisplayKit;
+		};
 		9B4B6D7630284A01008101B9 /* SnapCore */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = 9B4B6D7530284A01008101B9 /* XCRemoteSwiftPackageReference "SnapCore" */;
@@ -413,7 +433,7 @@
 		};
 		D10000010000000000000003 /* MediaRemoteAdapter */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = D10000010000000000000002 /* XCRemoteSwiftPackageReference "MediaRemoteAdapter" */;
+			package = D10000010000000000000002 /* XCRemoteSwiftPackageReference "mediaremote-adapter" */;
 			productName = MediaRemoteAdapter;
 		};
 /* End XCSwiftPackageProductDependency section */

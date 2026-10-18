@@ -24,5 +24,11 @@ struct macOSFramesToFireTVApp: App {
         .defaultLaunchBehavior(.suppressed)
         .defaultSize(width: 380, height: 280)
         .windowResizability(.contentSize)
+
+        Window("Virtual Display", id: MacVirtualDisplayWindow.id) {
+            MacVirtualDisplayView(model: model)
+        }
+        .defaultLaunchBehavior(.suppressed)
+        .restorationBehavior(.disabled)
     }
 }

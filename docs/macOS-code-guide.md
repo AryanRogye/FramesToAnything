@@ -84,7 +84,9 @@ Adaptive capture restarts preserve the existing bitrate ladder and caption worke
 quality changes during startup replace the pending capture scale.
 Trusted authentication automatically starts the main display. The Mac menu can
 select a specific connected display; that display ID survives capture restarts
-within the process. Mac Stop pauses incoming
+within the process. Virtual display creation waits until macOS lists the new
+screen; cancellation, timeout, and switching displays release it and its pending
+readiness subscription. Mac Stop pauses incoming
 sessions; Fire TV Disconnect cancels its retry intent.
 
 ## Concurrency rules to preserve

@@ -71,6 +71,7 @@ This is the macOS-only SwiftUI sender target.
 The Mac version:
 
 - Automatically captures the main display with SnapCore and ScreenCaptureKit; the Mac menu can select any connected display directly, without the system content picker.
+- Can create a virtual 4K display from **Capture Display**, stream it after macOS reports it ready, and open a local preview with cursor control. **Stop Virtual Display** returns capture to the main display.
 - Captures stereo system audio while excluding the microphone and the sender app's own audio.
 - Encodes H.264 in real time with B-frames disabled.
 - Discovers receivers for first-time pairing and authenticates incoming trusted receivers by their stable ID.
@@ -172,7 +173,7 @@ loop. Negotiated encrypted/authenticated heartbeats recover silent connections.
 
 Fire TV **Disconnect** cancels reconnection. Mac **Stop Streaming** pauses incoming
 connections; choose **Allow Incoming Connections** in the Mac menu to resume.
-Optional **Choose Display…**, quality, captions, and remote controls remain available.
+Optional **Capture Display**, quality, captions, and remote controls remain available.
 Reset/restart diagnostics are under **More** on Fire TV.
 
 See [connection implementation and checklist](docs/connection-recovery-plan.md).

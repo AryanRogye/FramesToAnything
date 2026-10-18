@@ -65,6 +65,23 @@ struct MacMenuBarContent: View {
                 } label: {
                     Label("Create Virtual Display And Stream", systemImage: "globe")
                 }
+                .disabled(model.virtualController != nil || model.isCreatingVirtualController)
+
+                if model.isCreatingVirtualController {
+                    Button("Cancel Virtual Display Setup") {
+                        model.cancelVirtualDisplaySetup()
+                    }
+                }
+
+                if model.virtualController != nil {
+                    Divider()
+                    Button("Open Virtual Display") {
+                        openWindow(id: MacVirtualDisplayWindow.id)
+                    }
+                    Button("Stop Virtual Display", systemImage: "stop.fill") {
+                        model.chooseDisplay(nil)
+                    }
+                }
 
                 Divider()
 

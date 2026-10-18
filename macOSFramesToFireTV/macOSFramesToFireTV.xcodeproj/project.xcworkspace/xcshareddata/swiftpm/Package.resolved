@@ -1,5 +1,5 @@
 {
-  "originHash" : "734139751eb916e512298e50e252f248d847747cbd4b7e0a4f198cb159a4a7de",
+  "originHash" : "b0ef00a0811ca9f74646d2958fc863180c7de4a131688c896156f8745a8c44d7",
   "pins" : [
     {
       "identity" : "mediaremote-adapter",
@@ -33,6 +33,15 @@
       "state" : {
         "revision" : "98ef3c98609a1e31b7e157b5b619579001a789d6",
         "version" : "1.7.1"
+      }
+    },
+    {
+      "identity" : "virtualdisplaykit",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/xocialize/VirtualDisplayKit",
+      "state" : {
+        "branch" : "main",
+        "revision" : "32227f2ccdbc982f8568dcee33ead2878a9698a6"
       }
     },
     {

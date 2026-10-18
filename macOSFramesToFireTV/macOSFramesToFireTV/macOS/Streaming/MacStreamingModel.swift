@@ -1,10 +1,12 @@
 #if os(macOS)
 import AppKit
 import CoreGraphics
+import Combine
 import Observation
 import Network
 import SnapCore
 import SwiftUI
+import VirtualDisplayKit
 
 struct MacCaptureDisplay: Identifiable, Equatable {
     let id: CGDirectDisplayID
@@ -20,6 +22,19 @@ final class MacStreamingModel {
     private(set) var selectedDisplayID: CGDirectDisplayID?
     private var captureStartupDeadline: Task<Void, Never>?
     private let captions = LiveCaptionExperiment()
+    private(set) var virtualController: VirtualDisplayController?
+    @ObservationIgnored private var pendingVirtualController: VirtualDisplayController?
+    @ObservationIgnored private var virtualReadiness: AnyCancellable?
+    @ObservationIgnored private var virtualCreationTimeout: Task<Void, Never>?
+    private(set) var isCreatingVirtualController = false
+
+    var virtualDisplay: VirtualDisplay? {
+        virtualController?.virtualDisplay
+    }
+
+    func moveCursor(to point: CGPoint) {
+        virtualController?.moveCursor(to: point)
+    }
 
     var devices: [MacFireTVDevice] = []
     var selectedDeviceID: String?
@@ -229,10 +244,79 @@ final class MacStreamingModel {
     }
 
     func createVirtualDisplayAndStream() {
-        
+        guard virtualController == nil, !isCreatingVirtualController else { return }
+
+        isCreatingVirtualController = true
+        let controller = VirtualDisplayController(
+            preset: .high4K
+        )
+        pendingVirtualController = controller
+        controller.start()
+
+        // VirtualDisplayKit marks the display ready only after NSScreen finds it.
+        virtualReadiness = controller.virtualDisplay.$isReady
+            .filter { $0 }
+            .prefix(1)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self, weak controller] _ in
+                Task { @MainActor [weak self, weak controller] in
+                    guard let self, let controller,
+                          self.pendingVirtualController === controller else { return }
+                    self.finishCreatingVirtualDisplay(controller)
+                }
+            }
+
+        virtualCreationTimeout = Task { @MainActor [weak self, weak controller] in
+            try? await Task.sleep(for: .seconds(10))
+            guard !Task.isCancelled, let self, let controller,
+                  self.pendingVirtualController === controller else { return }
+            self.stopVirtualDisplay()
+            self.captureError = "The virtual display did not become ready. Try creating it again."
+        }
+    }
+
+    private func finishCreatingVirtualDisplay(_ controller: VirtualDisplayController) {
+        guard let displayID = controller.displayID else {
+            stopVirtualDisplay()
+            captureError = "The virtual display has no display ID. Try creating it again."
+            return
+        }
+        virtualReadiness?.cancel()
+        virtualReadiness = nil
+        virtualCreationTimeout?.cancel()
+        virtualCreationTimeout = nil
+        pendingVirtualController = nil
+        isCreatingVirtualController = false
+        virtualController = controller
+        refreshDisplays()
+        chooseDisplay(displayID)
+    }
+
+    private func stopVirtualDisplay() {
+        virtualReadiness?.cancel()
+        virtualReadiness = nil
+        virtualCreationTimeout?.cancel()
+        virtualCreationTimeout = nil
+        pendingVirtualController?.stop()
+        pendingVirtualController = nil
+        isCreatingVirtualController = false
+        if selectedDisplayID == virtualController?.displayID {
+            selectedDisplayID = nil
+        }
+        virtualController?.stop()
+        virtualController = nil
+        refreshDisplays()
+    }
+
+    func cancelVirtualDisplaySetup() {
+        guard isCreatingVirtualController else { return }
+        stopVirtualDisplay()
     }
 
     func chooseDisplay(_ displayID: CGDirectDisplayID?) {
+        if displayID != virtualController?.displayID {
+            stopVirtualDisplay()
+        }
         selectedDisplayID = displayID
         captureError = nil
         guard connectionState.isConnected else { return }
@@ -322,12 +406,14 @@ final class MacStreamingModel {
     }
 
     func stopStreaming() {
+        stopVirtualDisplay()
         serverPaused = true
         transport.disconnect()
         scheduleCapture(start: false)
     }
 
     func stop() {
+        stopVirtualDisplay()
         scheduleCapture(start: false)
         transport.shutdown()
     }

@@ -1,17 +1,23 @@
 #if os(macOS)
 import AppKit
+import CoreGraphics
 import Observation
 import Network
 import SnapCore
-import ScreenCaptureKit
 import SwiftUI
+
+struct MacCaptureDisplay: Identifiable, Equatable {
+    let id: CGDirectDisplayID
+    let name: String
+    let isMain: Bool
+}
 
 @Observable
 @MainActor
 final class MacStreamingModel {
     private let transport = MacFireTVTransport()
     private var capture = ScreenRecordService()
-    private var usesSelectedDisplay = false
+    private(set) var selectedDisplayID: CGDirectDisplayID?
     private var captureStartupDeadline: Task<Void, Never>?
     private let captions = LiveCaptionExperiment()
 
@@ -48,11 +54,13 @@ final class MacStreamingModel {
     }
     var serverPaused = false
     var captureError: String?
+    private(set) var availableDisplays: [MacCaptureDisplay] = []
     private var requestedCaptureQuality: MacStreamQuality?
     private var captureGeneration: UInt64 = 0
     private var captureWork: Task<Void, Never>?
 
     init() {
+        refreshDisplays()
         let captionTransport = transport
         captions.onCaption = { cue in captionTransport.sendCaption(cue) }
         transport.onDevicesChanged = { [weak self] devices in
@@ -211,14 +219,29 @@ final class MacStreamingModel {
         scheduleCapture(start: true)
     }
 
-    /// Every capture operation waits for preceding cleanup. Old sessions cannot
-    /// finish stopping after a replacement session has started.
-    func chooseDisplay() {
-        guard connectionState.isConnected else { return }
-        scheduleCapture(start: true, chooseDisplay: true)
+    func refreshDisplays() {
+        let mainID = CGMainDisplayID()
+        availableDisplays = NSScreen.screens.compactMap { screen in
+            guard let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")]
+                    as? CGDirectDisplayID else { return nil }
+            return MacCaptureDisplay(id: id, name: screen.localizedName, isMain: id == mainID)
+        }
     }
 
-    private func scheduleCapture(start: Bool, quality: MacStreamQuality? = nil, chooseDisplay: Bool = false, resetQuality: Bool = true) {
+    func createVirtualDisplayAndStream() {
+        
+    }
+
+    func chooseDisplay(_ displayID: CGDirectDisplayID?) {
+        selectedDisplayID = displayID
+        captureError = nil
+        guard connectionState.isConnected else { return }
+        scheduleCapture(start: true)
+    }
+
+    /// Every capture operation waits for preceding cleanup. Old sessions cannot
+    /// finish stopping after a replacement session has started.
+    private func scheduleCapture(start: Bool, quality: MacStreamQuality? = nil, resetQuality: Bool = true) {
         requestedCaptureQuality = start ? (quality ?? selectedQuality) : nil
         captureStartupDeadline?.cancel()
         captureGeneration &+= 1
@@ -230,7 +253,7 @@ final class MacStreamingModel {
         capture.onAudioFrame = nil
         if start {
             captureStartupDeadline = Task { @MainActor [weak self] in
-                do { try await Task.sleep(for: .seconds(chooseDisplay ? 120 : 15)) } catch { return }
+                do { try await Task.sleep(for: .seconds(15)) } catch { return }
                 guard let self, generation == captureGeneration, !isStreaming else { return }
                 captureError = "Capture did not produce video. Reconnecting…"
                 captureWork?.cancel()
@@ -240,15 +263,10 @@ final class MacStreamingModel {
         captureWork = Task { @MainActor [weak self] in
             await previous?.value
             guard let self else { return }
-            SCContentSharingPicker.shared.remove(capture)
-            SCContentSharingPicker.shared.isActive = false
             await capture.stopRecording()
             guard generation == captureGeneration, !Task.isCancelled, start,
                   connectionState.isConnected, !serverPaused else { return }
-            if chooseDisplay {
-                capture = ScreenRecordService()
-                usesSelectedDisplay = true
-            }
+            capture = ScreenRecordService()
             configureCaptureCallbacks()
             let quality = quality ?? selectedQuality
             activeQuality = quality
@@ -257,11 +275,22 @@ final class MacStreamingModel {
                 transport.configureVideo(maximumQuality: selectedQuality)
             }
             do {
-                if usesSelectedDisplay && (chooseDisplay || capture.getCachedFilter() != nil) {
-                    capture.startRecording(scale: quality.captureScale, showsCursor: true,
-                                           capturesAudio: true, fps: .fps60)
+                if let selectedDisplayID {
+                    guard let screen = NSScreen.screens.first(where: {
+                        ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")]
+                            as? CGDirectDisplayID) == selectedDisplayID
+                    }) else {
+                        throw MacDisplayCaptureError.displayUnavailable
+                    }
+                    try await capture.recordFrame(
+                        frame: CGRect(origin: .zero, size: screen.frame.size),
+                        screen: screen,
+                        scale: quality.captureScale,
+                        showsCursor: true,
+                        capturesAudio: true,
+                        fps: .fps60
+                    )
                 } else {
-                    usesSelectedDisplay = false
                     try await capture.startRecordingMainDisplay(
                         scale: quality.captureScale, showsCursor: true,
                         capturesAudio: true, fps: .fps60
@@ -301,6 +330,14 @@ final class MacStreamingModel {
     func stop() {
         scheduleCapture(start: false)
         transport.shutdown()
+    }
+}
+
+private enum MacDisplayCaptureError: LocalizedError {
+    case displayUnavailable
+
+    var errorDescription: String? {
+        "The selected display is no longer connected. Choose another display and try again."
     }
 }
 #endif

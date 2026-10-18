@@ -82,8 +82,9 @@ Capture startup/cleanup is serialized on the main actor. A replacement session
 waits for preceding capture shutdown; generation checks reject old frame callbacks.
 Adaptive capture restarts preserve the existing bitrate ladder and caption worker;
 quality changes during startup replace the pending capture scale.
-Trusted authentication automatically starts the main display. Optional display
-selection retains a cached selection within the process. Mac Stop pauses incoming
+Trusted authentication automatically starts the main display. The Mac menu can
+select a specific connected display; that display ID survives capture restarts
+within the process. Mac Stop pauses incoming
 sessions; Fire TV Disconnect cancels its retry intent.
 
 ## Concurrency rules to preserve

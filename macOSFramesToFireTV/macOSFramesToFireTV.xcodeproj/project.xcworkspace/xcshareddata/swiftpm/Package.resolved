@@ -14,8 +14,7 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/AryanRogye/SnapCore",
       "state" : {
-        "branch" : "main",
-        "revision" : "2b28b5cdd6d4cb80b634b6b68938eb15715e4427"
+        "revision" : "0eaa54b243afd46836984d1fd2fd76b609c390ac"
       }
     },
     {

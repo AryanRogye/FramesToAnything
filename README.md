@@ -70,7 +70,7 @@ This is the macOS-only SwiftUI sender target.
 
 The Mac version:
 
-- Automatically captures the main display with SnapCore and ScreenCaptureKit; optional display selection remains in the Mac menu.
+- Automatically captures the main display with SnapCore and ScreenCaptureKit; the Mac menu can select any connected display directly, without the system content picker.
 - Captures stereo system audio while excluding the microphone and the sender app's own audio.
 - Encodes H.264 in real time with B-frames disabled.
 - Discovers receivers for first-time pairing and authenticates incoming trusted receivers by their stable ID.

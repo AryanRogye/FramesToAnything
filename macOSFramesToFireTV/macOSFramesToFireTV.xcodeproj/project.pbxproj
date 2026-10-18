@@ -381,8 +381,8 @@
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/AryanRogye/SnapCore";
 			requirement = {
-				branch = main;
-				kind = branch;
+				kind = revision;
+				revision = 0eaa54b243afd46836984d1fd2fd76b609c390ac;
 			};
 		};
 		CA0000010000000000000002 /* XCRemoteSwiftPackageReference "WhisperKit" */ = {

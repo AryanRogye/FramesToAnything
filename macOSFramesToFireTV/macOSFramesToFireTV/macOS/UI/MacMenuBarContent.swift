@@ -1,4 +1,5 @@
 #if os(macOS)
+import AppKit
 import SwiftUI
 
 struct MacMenuBarContent: View {
@@ -52,10 +53,35 @@ struct MacMenuBarContent: View {
             }
             .disabled(model.isStreaming)
 
-            Button("Choose Display…", systemImage: "display") {
-                model.chooseDisplay()
+            Menu("Capture Display", systemImage: "display") {
+                Button {
+                    model.chooseDisplay(nil)
+                } label: {
+                    Label("Follow Main Display", systemImage: model.selectedDisplayID == nil ? "checkmark" : "display")
+                }
+
+                Button {
+                    model.createVirtualDisplayAndStream()
+                } label: {
+                    Label("Create Virtual Display And Stream", systemImage: "globe")
+                }
+
+                Divider()
+
+                ForEach(model.availableDisplays) { display in
+                    Button {
+                        model.chooseDisplay(display.id)
+                    } label: {
+                        Label(
+                            display.isMain ? "\(display.name) (Main)" : display.name,
+                            systemImage: model.selectedDisplayID == display.id ? "checkmark" : "display"
+                        )
+                    }
+                }
             }
-            .disabled(!model.connectionState.isConnected)
+            .onReceive(NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)) { _ in
+                model.refreshDisplays()
+            }
 
             Toggle("Live Captions", isOn: $model.captionsEnabled)
 

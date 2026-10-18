@@ -1,0 +1,5 @@
+# TODO
+
+- [ ] **Sleep/wake recovery:** Restore the Mac listener and Bonjour advertisement after sleep or network changes, clean up stale sessions, and let the Fire TV reconnect using saved trust without restarting either app. Preserve macOS as the TCP server and Fire TV as the TCP client.
+- [ ] **One-click diagnostics export:** Export connection states, recent disconnect/retry reasons, app versions, and playback buffer statistics in a shareable file. Exclude pairing codes, saved credentials, session keys, and captured media.
+- [ ] **Mac remote-input mode:** Explicitly enter and exit a mode where the Fire TV remote's directional buttons move the Mac cursor and Select simulates a mouse click. Consider hold-to-accelerate movement, secondary click, scrolling, and an optional on-screen keyboard for typing on the Mac. Keep normal TV navigation outside this mode, require the Mac's Accessibility permission, and send input only through the authenticated connection. Release held inputs when exiting the mode or disconnecting. Preserve macOS as the TCP server and Fire TV as the TCP client.

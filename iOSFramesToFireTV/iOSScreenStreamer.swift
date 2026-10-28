@@ -104,17 +104,19 @@ nonisolated final class Transport: SampleBufferTransport, @unchecked Sendable {
                 using: parameters
             )
             self.browser = browser
-            browser.stateUpdateHandler = { [weak self] state in
+            browser.stateUpdateHandler = { [weak self, weak browser] state in
+                guard let self, let browser, browser === self.browser else { return }
                 switch state {
                 case .ready:
-                    self?.report(.searching)
+                    self.report(.searching)
                 case .failed(let error):
-                    self?.report(.failed("Discovery failed: \(error.localizedDescription)"))
+                    self.report(.failed("Discovery failed: \(error.localizedDescription)"))
                 default:
                     break
                 }
             }
-            browser.browseResultsChangedHandler = { [weak self] results, _ in
+            browser.browseResultsChangedHandler = { [weak self, weak browser] results, _ in
+                guard let self, let browser, browser === self.browser else { return }
                 let devices = results.compactMap { result -> FireTVDevice? in
                     guard case .service(let name, _, _, _) = result.endpoint else {
                         return nil
@@ -129,7 +131,7 @@ nonisolated final class Transport: SampleBufferTransport, @unchecked Sendable {
                     )
                 }
                 .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-                self?.publishDevices(devices)
+                self.publishDevices(devices)
             }
             browser.start(queue: networkQueue)
         }
@@ -464,6 +466,11 @@ nonisolated enum SharedRememberedReceiverStore {
         guard let value = UserDefaults(suiteName: appGroup)?
             .string(forKey: prefix + receiverID) else { return nil }
         return Data(base64Encoded: value)
+    }
+
+    static func delete(_ receiverID: String) {
+        UserDefaults(suiteName: appGroup)?
+            .removeObject(forKey: prefix + receiverID)
     }
 }
 

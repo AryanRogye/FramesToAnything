@@ -18,7 +18,7 @@ struct ContentView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
-                    Text("Choose your TV. Enter its code once, then reconnect without it on later broadcasts.")
+                    Text("Choose your TV. Enter its code the first time, then start a screen broadcast.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
 
@@ -72,6 +72,11 @@ struct ContentView: View {
                                 .buttonStyle(.plain)
                             }
                         }
+
+                        Button("Search again", systemImage: "arrow.clockwise") {
+                            model.startDiscovery()
+                        }
+                        .font(.footnote)
 
                         VStack(alignment: .leading, spacing: 6) {
                             Text("Or connect by address")
@@ -137,10 +142,10 @@ struct ContentView: View {
                         } label: {
                             Label(
                                 model.isPaired
-                                    ? "Ready to broadcast"
+                                    ? "Receiver selected"
                                     : (model.selectedDevice?.isRemembered == true
                                         ? "Use Remembered Fire TV"
-                                        : "Pair with Fire TV"),
+                                        : "Continue to Broadcast"),
                                 systemImage: model.isPaired || model.selectedDevice?.isRemembered == true
                                     ? "checkmark.shield.fill"
                                     : "lock.shield"
@@ -152,6 +157,20 @@ struct ContentView: View {
                         .tint(model.isPaired ? .green : .accentColor)
                         .disabled(!model.canPair || model.isPaired)
 
+                        if model.isPaired {
+                            Button("Change receiver", systemImage: "arrow.left.arrow.right") {
+                                model.changeReceiver()
+                            }
+                            .font(.footnote)
+                        }
+
+                        if model.selectedDevice?.isRemembered == true {
+                            Button("Pair again with a new code", systemImage: "arrow.counterclockwise") {
+                                model.resetSelectedReceiverForPairing()
+                            }
+                            .font(.footnote)
+                        }
+
                         Divider()
 
                         StepHeader(number: 3, title: "Broadcast your iPhone")
@@ -161,12 +180,12 @@ struct ContentView: View {
                                 .frame(maxWidth: .infinity)
                                 .frame(height: 54)
 
-                            Text("Choose FireTVBroadcast, then tap Start Broadcast. App audio is included automatically with hardware H.264 video at up to 60 fps.")
+                            Text("Choose FireTVBroadcast, then tap Start Broadcast. The TV checks your code or saved connection when the broadcast starts. App audio is included.")
                                 .font(.footnote)
                                 .foregroundStyle(.secondary)
                         } else {
                             Label(
-                                "Pair with the code above to continue",
+                                "Select a receiver and enter its code to continue",
                                 systemImage: "lock.fill"
                             )
                             .font(.subheadline)
@@ -242,10 +261,13 @@ final class ViewModel {
             }
         }
     }
-    var manualAddress = "192.168.68.112" {
+    var manualAddress = "" {
         didSet {
             if manualAddress != pairedManualAddress {
                 invalidatePairing()
+            }
+            if !manualAddress.isEmpty {
+                selectedDevice = nil
             }
         }
     }
@@ -254,26 +276,44 @@ final class ViewModel {
     private var pairedCode = ""
     private var pairedDeviceID: String?
     private var pairedManualAddress = ""
+    private var savedReceiverID: String?
+    private var savedServiceName: String?
 
     init() {
         let transport = Transport()
         self.transport = transport
 
+        restoreBroadcastConfiguration()
+
         transport.onDevicesChanged = { [weak self] devices in
-            self?.devices = devices
-            if let selected = self?.selectedDevice {
+            guard let self else { return }
+            self.devices = devices
+            if let selected = self.selectedDevice {
                 if let refreshed = devices.first(where: { $0.id == selected.id }) {
-                    self?.selectedDevice = refreshed
-                } else {
-                    self?.selectedDevice = nil
-                    self?.invalidatePairing()
+                    self.selectedDevice = refreshed
                 }
+            } else if let restored = devices.first(where: {
+                if let savedReceiverID = self.savedReceiverID {
+                    return $0.receiverID == savedReceiverID
+                }
+                return $0.name == self.savedServiceName
+            }) {
+                self.selectedDevice = restored
+                self.pairedDeviceID = restored.id
+                self.isPaired = restored.isRemembered || self.pairingCode.count == 6
+            }
+            if self.selectedDevice?.isRemembered == true,
+               !self.pairingCode.isEmpty {
+                self.pairedCode = ""
+                self.pairingCode = ""
+                UserDefaults(suiteName: "group.com.aryanrogye.iOSFramesToFireTV")?
+                    .removeObject(forKey: "broadcast.pairingCode")
             }
         }
     }
 
     var canPair: Bool {
-        (selectedDevice != nil || !manualAddress.trimmingCharacters(in: .whitespaces).isEmpty) &&
+        (selectedDevice != nil || !manualAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) &&
             (selectedDevice?.isRemembered == true || pairingCode.filter(\.isNumber).count == 6)
     }
 
@@ -286,6 +326,9 @@ final class ViewModel {
             invalidatePairing()
         }
         selectedDevice = device
+        manualAddress = ""
+        savedReceiverID = nil
+        savedServiceName = nil
     }
 
     func pair() {
@@ -299,8 +342,23 @@ final class ViewModel {
         isPaired = true
     }
 
+    func changeReceiver() {
+        invalidatePairing()
+        selectedDevice = nil
+        pairingCode = ""
+        savedReceiverID = nil
+        savedServiceName = nil
+    }
+
+    func resetSelectedReceiverForPairing() {
+        guard let receiverID = selectedDevice?.receiverID else { return }
+        SharedRememberedReceiverStore.delete(receiverID)
+        changeReceiver()
+        startDiscovery()
+    }
+
     private func invalidatePairing() {
-        guard isPaired || !pairedCode.isEmpty || pairedDeviceID != nil else {
+        guard isPaired || !pairedCode.isEmpty || pairedDeviceID != nil || !pairedManualAddress.isEmpty else {
             return
         }
         isPaired = false
@@ -335,11 +393,27 @@ final class ViewModel {
         }
 
         let normalizedCode = pairingCode.filter(\.isNumber)
-        if normalizedCode.count == 6 {
+        if selectedDevice?.isRemembered != true && normalizedCode.count == 6 {
             defaults.set(normalizedCode, forKey: "broadcast.pairingCode")
         } else {
             defaults.removeObject(forKey: "broadcast.pairingCode")
         }
+    }
+
+    private func restoreBroadcastConfiguration() {
+        guard let defaults = UserDefaults(suiteName: "group.com.aryanrogye.iOSFramesToFireTV") else {
+            return
+        }
+        // Discovery fills in the endpoint later. A saved manual address is usable immediately.
+        if let address = defaults.string(forKey: "broadcast.manualHost"), !address.isEmpty {
+            manualAddress = address
+            pairedManualAddress = address
+        }
+        savedReceiverID = defaults.string(forKey: "broadcast.receiverID")
+        savedServiceName = defaults.string(forKey: "broadcast.serviceName")
+        pairingCode = defaults.string(forKey: "broadcast.pairingCode") ?? ""
+        pairedCode = pairingCode
+        isPaired = !pairedManualAddress.isEmpty && pairingCode.count == 6
     }
 
     private func clearBroadcastConfiguration() {

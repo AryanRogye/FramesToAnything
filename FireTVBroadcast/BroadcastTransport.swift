@@ -1,4 +1,6 @@
+import AVFoundation
 import CommonCrypto
+import CoreImage
 import CoreMedia
 import CryptoKit
 import ImageIO
@@ -52,7 +54,12 @@ nonisolated final class BroadcastTransport: @unchecked Sendable {
 
     private let configuration: BroadcastConfiguration
     private let networkQueue = DispatchQueue(label: "com.aryanrogye.firetv.broadcast.network")
+    private let videoQueue = DispatchQueue(label: "com.aryanrogye.firetv.broadcast.framing", qos: .userInteractive)
+    private let videoFrameLock = NSLock()
     private let keyLock = NSLock()
+    private let videoFramer = BroadcastVideoFramer()
+    private let audioConverter = BroadcastAudioConverter()
+    private var videoFramePending = false
 
     private let mediaEncoder: LiveMediaEncoder
 
@@ -75,7 +82,7 @@ nonisolated final class BroadcastTransport: @unchecked Sendable {
         let encoder = LiveMediaEncoder(
             configuration: .init(
                 framesPerSecond: 60,
-                averageBitRate: 10_000_000,
+                averageBitRate: 6_000_000,
                 keyFrameInterval: 60
             )
         )
@@ -84,6 +91,12 @@ nonisolated final class BroadcastTransport: @unchecked Sendable {
             self?.sendMedia(packet)
         }
         encoder.onError = { [weak self] message in
+            self?.networkQueue.async { [weak self] in self?.fail(message) }
+        }
+        audioConverter.onPacket = { [weak self] packet in
+            self?.sendMedia(packet)
+        }
+        audioConverter.onError = { [weak self] message in
             self?.networkQueue.async { [weak self] in self?.fail(message) }
         }
     }
@@ -112,13 +125,27 @@ nonisolated final class BroadcastTransport: @unchecked Sendable {
         guard !isPaused, currentStreamingKey() != nil else { return }
         switch type {
         case .video:
-            mediaEncoder.encodeVideo(
-                sampleBuffer,
-                rotationDegrees: Self.videoRotationDegrees(from: sampleBuffer)
-            )
+            guard let source = CMSampleBufferGetImageBuffer(sampleBuffer),
+                  videoFrameLock.withLock({
+                      guard !videoFramePending else { return false }
+                      videoFramePending = true
+                      return true
+                  }) else { return }
+            let retained = BroadcastPixelBuffer(source)
+            let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+            let orientation = Self.videoOrientation(from: sampleBuffer)
+            videoQueue.async { [weak self] in
+                guard let self else { return }
+                defer { self.videoFrameLock.withLock { self.videoFramePending = false } }
+                guard self.currentStreamingKey() != nil,
+                      let framed = self.videoFramer.frame(retained.value, orientation: orientation) else {
+                    return
+                }
+                self.mediaEncoder.encodeVideo(framed, timestamp: timestamp, rotationDegrees: 0)
+            }
         case .audioApp:
             // App audio is the sound users expect to hear on the Fire TV.
-            mediaEncoder.encodeAudio(sampleBuffer)
+            audioConverter.encode(sampleBuffer)
         case .audioMic:
             // The microphone is intentionally not mixed into streamed content.
             break
@@ -402,9 +429,10 @@ nonisolated final class BroadcastTransport: @unchecked Sendable {
             if kind == .video {
                 latestVideoPacket = packet
             } else {
-                if pendingPackets.count >= Self.maximumPendingPackets,
-                   let staleAudio = pendingPackets.firstIndex(where: { $0.kind == .audio }) {
-                    pendingPackets.remove(at: staleAudio)
+                if kind == .audio &&
+                    pendingPackets.lazy.filter({ $0.kind == .audio }).count >= Self.maximumPendingAudioPackets {
+                    fail("The Wi-Fi connection cannot keep up with audio. Move closer to the Fire TV and start a new broadcast.")
+                    return
                 }
                 pendingPackets.append(QueuedPacket(data: packet, kind: kind))
             }
@@ -543,22 +571,26 @@ nonisolated final class BroadcastTransport: @unchecked Sendable {
         return Data(bytes)
     }
 
-    private static func videoRotationDegrees(
+    private static func videoOrientation(
         from sampleBuffer: CMSampleBuffer
-    ) -> UInt16 {
+    ) -> CGImagePropertyOrientation {
         guard let value = CMGetAttachment(
             sampleBuffer,
             key: RPVideoSampleOrientationKey as CFString,
             attachmentModeOut: nil
         ) as? NSNumber,
               let orientation = CGImagePropertyOrientation(rawValue: value.uint32Value) else {
-            return 0
+            return .up
         }
-        return switch orientation {
-        case .down, .downMirrored: 180
-        case .left, .leftMirrored: 90
-        case .right, .rightMirrored: 270
-        default: 0
+        // ReplayKit's landscape attachment describes the device turn, while
+        // CIImage.oriented(_:) applies an image turn. Use the opposite quarter
+        // turn so landscape content is upright in the encoded 16:9 frame.
+        switch orientation {
+        case .left: return .right
+        case .right: return .left
+        case .leftMirrored: return .rightMirrored
+        case .rightMirrored: return .leftMirrored
+        default: return orientation
         }
     }
 
@@ -572,7 +604,196 @@ nonisolated final class BroadcastTransport: @unchecked Sendable {
     private static let encryptedMediaPacket: UInt8 = 2
     private static let mediaVersion: UInt8 = 2
     private static let maximumJSONPacketBytes: UInt32 = 64 * 1024
-    private static let maximumPendingPackets = 24
+    // Roughly three seconds of ReplayKit's typical 48 kHz / 1,024-frame PCM
+    // packets. Dropping individual PCM packets produces audible crackles and
+    // repeatedly resets the receiver's audio clock.
+    private static let maximumPendingAudioPackets = 150
+}
+
+nonisolated private final class BroadcastPixelBuffer: @unchecked Sendable {
+    let value: CVPixelBuffer
+
+    init(_ value: CVPixelBuffer) {
+        self.value = value
+    }
+}
+
+/// The Fire TV renders into a full-screen 16:9 surface. Bake orientation and
+/// aspect-fit bars into the encoded frame so portrait video cannot be stretched.
+nonisolated private final class BroadcastVideoFramer {
+    private static let width = 1280
+    private static let height = 720
+    private let context = CIContext(options: [.cacheIntermediates: false])
+    private let colorSpace = CGColorSpaceCreateDeviceRGB()
+    private let pool: CVPixelBufferPool?
+
+    init() {
+        var createdPool: CVPixelBufferPool?
+        let attributes: [CFString: Any] = [
+            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey: Self.width,
+            kCVPixelBufferHeightKey: Self.height,
+            kCVPixelBufferIOSurfacePropertiesKey: [:] as [String: Any],
+        ]
+        CVPixelBufferPoolCreate(
+            kCFAllocatorDefault,
+            [kCVPixelBufferPoolMinimumBufferCountKey: 3] as CFDictionary,
+            attributes as CFDictionary,
+            &createdPool
+        )
+        pool = createdPool
+    }
+
+    func frame(
+        _ source: CVPixelBuffer,
+        orientation: CGImagePropertyOrientation
+    ) -> CVPixelBuffer? {
+        guard let pool else { return nil }
+        var destination: CVPixelBuffer?
+        let status = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
+            kCFAllocatorDefault,
+            pool,
+            [kCVPixelBufferPoolAllocationThresholdKey: 4] as CFDictionary,
+            &destination
+        )
+        guard status == kCVReturnSuccess, let destination else { return nil }
+
+        let upright = CIImage(cvPixelBuffer: source).oriented(orientation)
+        let extent = upright.extent
+        guard extent.width > 0, extent.height > 0 else { return nil }
+        let canvas = CGRect(x: 0, y: 0, width: Self.width, height: Self.height)
+        let scale = min(canvas.width / extent.width, canvas.height / extent.height)
+        let fitted = upright
+            .transformed(by: CGAffineTransform(translationX: -extent.minX, y: -extent.minY))
+            .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+            .transformed(by: CGAffineTransform(
+                translationX: (canvas.width - extent.width * scale) / 2,
+                y: (canvas.height - extent.height * scale) / 2
+            ))
+        let image = fitted.composited(over: CIImage(color: .black).cropped(to: canvas))
+        context.render(image, to: destination, bounds: canvas, colorSpace: colorSpace)
+        return destination
+    }
+}
+
+nonisolated private struct BroadcastAudioSample: @unchecked Sendable {
+    let value: CMSampleBuffer
+}
+
+/// ReplayKit commonly supplies planar floating-point app audio. Convert from
+/// its declared Core Media format instead of interpreting sample bytes by hand.
+nonisolated private final class BroadcastAudioConverter: @unchecked Sendable {
+    var onPacket: (@Sendable (LiveMediaPacket) -> Void)?
+    var onError: (@Sendable (String) -> Void)?
+
+    private let queue = DispatchQueue(label: "com.aryanrogye.firetv.broadcast.audio", qos: .userInteractive)
+    private var converter: AVAudioConverter?
+    private var inputFormat: AVAudioFormat?
+    private var outputFormat: AVAudioFormat?
+
+    func encode(_ sampleBuffer: CMSampleBuffer) {
+        guard CMSampleBufferDataIsReady(sampleBuffer) else { return }
+        let retained = BroadcastAudioSample(value: sampleBuffer)
+        queue.async { [weak self] in self?.convert(retained.value) }
+    }
+
+    private func convert(_ sample: CMSampleBuffer) {
+        let frameCount = CMSampleBufferGetNumSamples(sample)
+        guard frameCount > 0,
+              let description = CMSampleBufferGetFormatDescription(sample) else { return }
+        let format = AVAudioFormat(cmAudioFormatDescription: description)
+        guard format.sampleRate > 0,
+              frameCount <= Int(format.sampleRate),
+              let input = AVAudioPCMBuffer(
+                  pcmFormat: format,
+                  frameCapacity: AVAudioFrameCount(frameCount)
+              ) else {
+            onError?("ReplayKit supplied an unsupported app-audio format.")
+            return
+        }
+        input.frameLength = AVAudioFrameCount(frameCount)
+        guard CMSampleBufferCopyPCMDataIntoAudioBufferList(
+            sample,
+            at: 0,
+            frameCount: Int32(frameCount),
+            into: input.mutableAudioBufferList
+        ) == noErr else {
+            onError?("Could not read ReplayKit app audio.")
+            return
+        }
+
+        if inputFormat != format {
+            let channels = min(format.channelCount, 2)
+            guard channels > 0,
+                  let pcmFormat = AVAudioFormat(
+                      commonFormat: .pcmFormatInt16,
+                      sampleRate: format.sampleRate,
+                      channels: channels,
+                      interleaved: true
+                  ),
+                  let newConverter = AVAudioConverter(from: format, to: pcmFormat) else {
+                onError?("Could not prepare app-audio conversion.")
+                return
+            }
+            newConverter.primeMethod = .none
+            converter = newConverter
+            inputFormat = format
+            outputFormat = pcmFormat
+
+            var configuration = Data()
+            var sampleRate = UInt32(format.sampleRate.rounded()).bigEndian
+            withUnsafeBytes(of: &sampleRate) { configuration.append(contentsOf: $0) }
+            configuration.append(UInt8(channels))
+            configuration.append(1) // Interleaved signed 16-bit PCM.
+            onPacket?(LiveMediaPacket(
+                kind: .audioConfiguration,
+                timestampMilliseconds: Self.timestampMilliseconds(for: sample),
+                payload: configuration
+            ))
+        }
+
+        guard let converter, let outputFormat,
+              let output = AVAudioPCMBuffer(
+                  pcmFormat: outputFormat,
+                  frameCapacity: AVAudioFrameCount(frameCount + 64)
+              ) else { return }
+        var supplied = false
+        var error: NSError?
+        let status = converter.convert(to: output, error: &error) { _, inputStatus in
+            guard !supplied else {
+                inputStatus.pointee = .noDataNow
+                return nil
+            }
+            supplied = true
+            inputStatus.pointee = .haveData
+            return input
+        }
+        guard status != .error, error == nil else {
+            onError?("Could not convert ReplayKit app audio to PCM.")
+            return
+        }
+        guard output.frameLength > 0 else { return }
+        let expectedBytes = Int(output.frameLength) * Int(outputFormat.channelCount) * 2
+        let buffer = output.audioBufferList.pointee.mBuffers
+        guard expectedBytes > 0,
+              output.audioBufferList.pointee.mNumberBuffers == 1,
+              Int(buffer.mDataByteSize) >= expectedBytes,
+              let bytes = buffer.mData else {
+            onError?("Could not convert ReplayKit app audio to PCM.")
+            return
+        }
+        onPacket?(LiveMediaPacket(
+            kind: .audioFrame,
+            timestampMilliseconds: Self.timestampMilliseconds(for: sample),
+            payload: Data(bytes: bytes, count: expectedBytes)
+        ))
+    }
+
+    private static func timestampMilliseconds(for sample: CMSampleBuffer) -> UInt64 {
+        let seconds = CMSampleBufferGetPresentationTimeStamp(sample).seconds
+        guard seconds.isFinite, seconds >= 0 else { return 0 }
+        return UInt64(seconds * 1_000)
+    }
 }
 
 nonisolated private enum BroadcastRememberedReceiverStore {

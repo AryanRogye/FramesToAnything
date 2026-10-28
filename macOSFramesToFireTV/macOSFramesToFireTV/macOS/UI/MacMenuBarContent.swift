@@ -123,7 +123,6 @@ struct MacMenuBarContent: View {
         Divider()
 
         Button("Quit Frames to Fire TV") {
-            model.stop()
             NSApplication.shared.terminate(nil)
         }
         .keyboardShortcut("q")

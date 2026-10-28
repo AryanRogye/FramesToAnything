@@ -9,7 +9,9 @@ import SwiftUI
 
 @main
 struct macOSFramesToFireTVApp: App {
-    @State private var model = MacStreamingModel()
+    @NSApplicationDelegateAdaptor(MacAppDelegate.self) private var appDelegate
+
+    private var model: MacStreamingModel { appDelegate.model }
 
     var body: some Scene {
         MenuBarExtra {
